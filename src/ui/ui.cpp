@@ -13,6 +13,7 @@
 #include "core/aircraftdb.h"
 #include "core/settings.h"
 #include "display.h"
+#include "icons.h"
 #include "hw/clock.h"
 #include "hw/keypad.h"
 #include "hw/power.h"
@@ -760,8 +761,28 @@ void drawDetail() {
         }
     }
 
+    // Who operates it, on its own full-width line rather than as a row: these
+    // run to 47 characters where every row value fits in nine, and giving it a
+    // column would have squeezed everything else or collided with the
+    // silhouette on the right.
+    if (known && db.op[0]) {
+        snprintf(buf, sizeof(buf), "%.39s", db.op);
+        textAt(4, y, buf);
+        y += 10;
+    }
+
     g().drawFastHLine(4, y, SCREEN_W - 8, BLACK);
     y += 6;
+
+    // Plan-view silhouette, right-aligned against the rows below. Drawn from
+    // the feed's type designator where it has one and the database's
+    // otherwise, so it still appears for a local receiver that sends neither.
+    const char *iconType = a->type[0] ? a->type : (known ? db.type : "");
+    int16_t iconW = 0, iconH = 0;
+    if (iconType[0] && icons::size(iconType, &iconW, &iconH)) {
+        icons::draw(iconType, static_cast<int16_t>(SCREEN_W - 4 - iconW),
+                    static_cast<int16_t>(y + 2));
+    }
 
     auto row = [&](const char *label, const char *value) {
         textAt(4, y, label);
@@ -775,12 +796,6 @@ void drawDetail() {
     row("Reg", a->reg[0] ? a->reg : (known && db.reg[0] ? db.reg : "--"));
     row("Type", a->type[0] ? a->type : (known && db.type[0] ? db.type : "--"));
 
-    if (known && db.op[0]) {
-        // Operator names run past the panel; the row column starts at 11
-        // characters in, leaving 28 or so.
-        snprintf(buf, sizeof(buf), "%.28s", db.op);
-        row("Operator", buf);
-    }
     if (known && db.year != 0) {
         snprintf(buf, sizeof(buf), "%u", static_cast<unsigned>(db.year));
         row("Built", buf);
@@ -962,6 +977,7 @@ void drawStatus() {
     row("Input", buf);
 
     row("AC db", aircraftdb::status());
+    row("Icons", icons::status());
     row("Settings", settings::status());
 
     snprintf(buf, sizeof(buf), "%u k / %u k",

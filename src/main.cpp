@@ -25,6 +25,7 @@
 #include "net/net.h"
 #include "ui/basemap.h"
 #include "ui/display.h"
+#include "ui/icons.h"
 #include "ui/ui.h"
 
 namespace {
@@ -195,6 +196,7 @@ void setup() {
     wallclock::begin();
     basemap::begin();
     aircraftdb::begin();
+    icons::begin();
     ui::begin();
 
     refreshBattery();

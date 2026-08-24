@@ -366,6 +366,50 @@ python tools/verify_db.py                      # structure + a sample
 python tools/verify_db.py --hex c82347 7c561d  # resolve specific aircraft
 ```
 
+## Aircraft silhouettes
+
+The detail page draws the selected aircraft in plan view, so a target reads as a
+widebody or a helicopter at a glance rather than only as four letters:
+
+```
+python tools/build_icons.py
+pio run -t uploadfs
+```
+
+79 shapes covering **2,640 ICAO type designators in 87 KB**. Coverage comes from
+two sources stacked: tar1090's own table names an exact shape for 360 common
+designators, and ICAO Doc 8643 supplies the class and engine fitment of the
+rest, which maps onto tar1090's generic shapes. A C172 has no silhouette of its
+own, but Doc 8643 calls it a single-engine piston landplane and there is a shape
+for that. Of the resolved designators, 360 are exact and 2,202 are by class.
+
+All the geometry happens in the build tool: it parses the SVG paths, flattens
+the curves to polygons and scan-converts them, so the firmware only indexes a
+table and calls `drawBitmap()`. Twin jets are the one place needing judgement --
+tar1090 distinguishes them only once a wake category is known, and Doc 8643 does
+not carry one, so a short list of widebodies is corrected by hand and everything
+else takes the generic airliner.
+
+Since the e-paper cannot be screenshotted,
+[`tools/verify_icons.py`](tools/verify_icons.py) is the only way to see what was
+rasterised before flashing it. It re-reads the blob with an independent parser
+and draws the shapes as text:
+
+```
+python tools/verify_icons.py --type A320 C172 R44
+```
+
+It also fails loudly on the three ways this can silently go wrong: a designator
+table that is not sorted (the firmware binary-searches it), a shape that
+rasterised to nothing, and a shape that came out an almost-solid block, which is
+what a mistaken winding rule looks like.
+
+> **Licence.** tar1090's LICENSE names an author and a dump1090 ancestry without
+> naming a licence, and GitHub reads it as `NOASSERTION`. Fine for a device you
+> build for yourself, unresolved for anything you publish. The artwork is not
+> committed here for that reason -- the script fetches it, and `data/icons.bin`
+> is gitignored with the other generated blobs.
+
 ## Settings that survive a reboot
 
 Range, basemap on/off, GNSS centring, keyboard backlight and the chosen feed are
@@ -398,6 +442,7 @@ src/
     adsb_source.{h,cpp} HTTPS GET + filtered streaming JSON parse
   ui/
     display.{h,cpp}     GxEPD2 wrapper and the refresh policy
+    icons.{h,cpp}       type designator -> plan-view silhouette
     ui.{h,cpp}          views, input handling, layout
 ```
 
@@ -460,8 +505,8 @@ UART, I2C and SPI peripherals need no re-tuning across the change.
 ```
 RAM:   21.3% (69,928 / 327,680 bytes)
 Flash: 15.7% (1,026,645 / 6,553,600 bytes)
-SPIFFS: 73 KB basemap + 801 KB aircraft database, of 3.4 MB
-PSRAM:  800 KB, holding the aircraft database for the life of the run
+SPIFFS: 73 KB basemap + 801 KB aircraft database + 87 KB silhouettes, of 3.4 MB
+PSRAM:  887 KB, holding both tables for the life of the run
 
 Pinning ADSB_PROVIDER_DEFAULT to LOCAL and deleting the aggregator branch of
 adsb::fetch() drops mbedtls and takes flash to 13.7% (898,381 bytes).

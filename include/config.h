@@ -108,6 +108,14 @@ enum class AdsbProvider : uint8_t { ADSB_LOL, ADSB_FI, AIRPLANES_LIVE, LOCAL };
 // Absent, those columns stay empty exactly as they did before.
 #define AIRCRAFT_DB_FILE "/aircraftdb.bin"
 
+// Plan-view silhouettes for the detail page, keyed by type designator:
+//
+//     python tools/build_icons.py        # writes data/icons.bin
+//     pio run -t uploadfs
+//
+// Also optional. Absent, the detail page simply lays out without one.
+#define ICON_FILE "/icons.bin"
+
 // Airport idents are only drawn at or below this range, where there is room
 // for them without burying the traffic.
 #define MAP_LABEL_RANGE_NM 40
