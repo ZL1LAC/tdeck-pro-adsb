@@ -111,6 +111,7 @@ Keyboard:
 | `g` | Take your own position from GNSS vs. the configured home |
 | `l` | Keyboard backlight |
 | `m` | Basemap on / off |
+| `p` | Swap feed: your own receiver / the aggregator |
 | `i` | Diagnostics page |
 
 In the list and detail views there is nothing to pan, so `w`/`s` move the
@@ -144,7 +145,7 @@ Your own receiver, or one of three key-less public aggregators. Pick with
 
 | Provider | Endpoint | Notes |
 | --- | --- | --- |
-| `LOCAL` (default) | `ADSB_LOCAL_URL` in secrets.h | Your Pi. Plain HTTP, sub-second positions |
+| `LOCAL` (default) | `ADSB_LOCAL_URL` in secrets.h | Your own receiver. Plain HTTP, sub-second positions |
 | `ADSB_FI` | `opendata.adsb.fi` | Includes the `desc` type description |
 | `ADSB_LOL` | `api.adsb.lol` | No published rate limit |
 | `AIRPLANES_LIVE` | `api.airplanes.live` | Asks for ≤ 1 request/second |
@@ -152,6 +153,20 @@ Your own receiver, or one of three key-less public aggregators. Pick with
 All four serve the same readsb-shaped JSON, so one parser and one field filter
 cover the lot; they differ only in URL layout and in whether the array is called
 `aircraft` or `ac`.
+
+`ADSB_PROVIDER_DEFAULT` picks what the firmware boots on and `p` swaps between
+that and `ADSB_PROVIDER_REMOTE` at runtime, so you can walk out of Wi-Fi range
+and keep seeing traffic. The radar footer names whichever is live. Two things
+follow from the swap being a runtime choice rather than a compiled-in one:
+both transports are linked, which costs about 120 KB of flash in mbedtls that a
+local-only build would not pay; and there is no NVS yet, so the choice lasts
+until the next reboot.
+
+Switching leaves the old feed's targets to age out rather than clearing them.
+They merge by ICAO hex and `mergeString()` only overwrites a field that arrives
+with something in it, so a trip through the aggregator fills in the registration
+and type that a local `aircraft.json` does not carry, and they survive the swap
+back while positions return to being a fraction of a second old.
 
 ### Feeding from your own receiver
 
@@ -371,10 +386,12 @@ UART, I2C and SPI peripherals need no re-tuning across the change.
 ## Current footprint
 
 ```
-RAM:   21.0% (68,796 / 327,680 bytes)
-Flash: 13.7% (898,381 / 6,553,600 bytes)     -- LOCAL feed; mbedtls unlinked
-Flash: 15.6% (1,019,469 / 6,553,600 bytes)   -- aggregator feed, with TLS
+RAM:   21.3% (69,760 / 327,680 bytes)
+Flash: 15.6% (1,020,949 / 6,553,600 bytes)
 SPIFFS: 73 KB of 3.4 MB used by the basemap (coast + airports + airspace)
+
+Pinning ADSB_PROVIDER_DEFAULT to LOCAL and deleting the aggregator branch of
+adsb::fetch() drops mbedtls and takes flash to 13.7% (898,381 bytes).
 ```
 
 Measured on hardware against an aggregator: ~29 aircraft per poll, 1.3–1.5 s per

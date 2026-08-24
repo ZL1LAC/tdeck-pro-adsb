@@ -622,8 +622,13 @@ void drawRadar() {
 
     drawRadarButtons();
 
-    drawSelectionFooter(isPanned() ? "drag:pan  c:recentre  z/x:zoom"
-                                   : "drag:pan  t:list  z/x:zoom  m:map");
+    // Naming the feed in the hint line does double duty: it says which source
+    // the plot came from, and it says which key changes it. Dragging is the
+    // one thing on this screen nobody needs telling about.
+    char hints[48];
+    snprintf(hints, sizeof(hints), "p:%s  t:list  z/x:zoom  m:map",
+             adsb::providerName());
+    drawSelectionFooter(isPanned() ? "drag:pan  c:recentre  z/x:zoom" : hints);
 }
 
 // ---------------------------------------------------------- list view ------
@@ -1041,6 +1046,17 @@ void handleKey(char key) {
 
         case 'm':
             gMapEnabled = !gMapEnabled;
+            display::invalidate();
+            break;
+
+        // Swap between your own receiver and the aggregator. The old feed's
+        // targets are left to age out rather than cleared: they merge by ICAO
+        // hex, so switching to the aggregator fills in the registration and
+        // type a local aircraft.json does not carry, and switching back keeps
+        // them while positions go back to being a fraction of a second old.
+        case 'p':
+            adsb::toggleProvider();
+            gRefreshRequested = true;
             display::invalidate();
             break;
 

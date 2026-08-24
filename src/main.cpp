@@ -144,13 +144,13 @@ void pollFeed(double lat, double lon, uint16_t radiusNm) {
 
     const adsb::FetchStats stats = adsb::fetch(gTracker, lat, lon, radiusNm);
     if (stats.result == adsb::Result::RateLimited) {
-        gNextPollMs = millis() + ADSB_POLL_MIN_INTERVAL_MS;
+        gNextPollMs = millis() + adsb::minIntervalMs();
         return;
     }
     // Back off a little on failure so a dead feed does not hammer the link.
     gNextPollMs = millis() + (stats.result == adsb::Result::Ok
-                                  ? ADSB_POLL_INTERVAL_MS
-                                  : ADSB_POLL_INTERVAL_MS * 2);
+                                  ? adsb::pollIntervalMs()
+                                  : adsb::pollIntervalMs() * 2);
 }
 
 void refreshBattery() {

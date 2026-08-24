@@ -20,6 +20,13 @@ uint32_t gLastAttemptMs = 0;
 uint32_t gLastSuccessMs = 0;
 FetchStats gLastStats;
 
+AdsbProvider gProvider = ADSB_PROVIDER_DEFAULT;
+
+uint32_t httpTimeoutMs() {
+    return (gProvider == AdsbProvider::LOCAL) ? ADSB_LOCAL_HTTP_TIMEOUT_MS
+                                              : ADSB_REMOTE_HTTP_TIMEOUT_MS;
+}
+
 // ArduinoJson allocates the parse tree in one arena. A busy 250 nm query can
 // run to a couple of hundred kilobytes, which would starve the Wi-Fi stack if
 // it came from internal RAM -- so put it in the 8 MB PSRAM instead.
@@ -38,14 +45,14 @@ struct PsramAllocator : ArduinoJson::Allocator {
 const char *arrayKey() {
     // readsb and adsb.fi both name it "aircraft"; adsb.lol and airplanes.live
     // shorten it to "ac".
-    return (ADSB_PROVIDER == AdsbProvider::ADSB_FI ||
-            ADSB_PROVIDER == AdsbProvider::LOCAL)
+    return (gProvider == AdsbProvider::ADSB_FI ||
+            gProvider == AdsbProvider::LOCAL)
                ? "aircraft"
                : "ac";
 }
 
 void buildUrl(char *out, size_t len, double lat, double lon, int radiusNm) {
-    switch (ADSB_PROVIDER) {
+    switch (gProvider) {
         case AdsbProvider::LOCAL:
             // A receiver's aircraft.json is a fixed path holding everything it
             // currently hears -- there is nothing to parameterise, and the
@@ -237,8 +244,33 @@ bool decodeAircraft(JsonObjectConst src, Aircraft *out) {
 
 }  // namespace
 
+AdsbProvider provider() { return gProvider; }
+
+bool isLocal() { return gProvider == AdsbProvider::LOCAL; }
+
+void setProvider(AdsbProvider p) {
+    if (p == gProvider) return;
+    gProvider = p;
+    // The next poll is against a different endpoint with a different idea of
+    // what is nearby, so nothing about the last one is worth reporting.
+    gLastStats = FetchStats{};
+    log_i("adsb: feed switched to %s", providerName());
+}
+
+void toggleProvider() {
+    setProvider(isLocal() ? ADSB_PROVIDER_REMOTE : AdsbProvider::LOCAL);
+}
+
+uint32_t pollIntervalMs() {
+    return isLocal() ? ADSB_LOCAL_POLL_INTERVAL_MS : ADSB_REMOTE_POLL_INTERVAL_MS;
+}
+
+uint32_t minIntervalMs() {
+    return isLocal() ? ADSB_LOCAL_MIN_INTERVAL_MS : ADSB_REMOTE_MIN_INTERVAL_MS;
+}
+
 const char *providerName() {
-    switch (ADSB_PROVIDER) {
+    switch (gProvider) {
         case AdsbProvider::LOCAL: return "local rx";
         case AdsbProvider::ADSB_FI: return "adsb.fi";
         case AdsbProvider::AIRPLANES_LIVE: return "airplanes.live";
@@ -258,8 +290,8 @@ FetchStats runFetch(WiFiClient &client, const char *url, Tracker &tracker,
     FetchStats stats;
 
     HTTPClient http;
-    http.setTimeout(ADSB_HTTP_TIMEOUT_MS);
-    http.setConnectTimeout(ADSB_HTTP_TIMEOUT_MS);
+    http.setTimeout(httpTimeoutMs());
+    http.setConnectTimeout(httpTimeoutMs());
     // HTTP/1.0 asks the server not to chunk the body, which lets ArduinoJson
     // read straight off the socket.
     http.useHTTP10(true);
@@ -293,7 +325,7 @@ FetchStats runFetch(WiFiClient &client, const char *url, Tracker &tracker,
     // session, which is already the tightest thing in the firmware.
     static uint8_t rxBuffer[2048];
     BufferedStream buffered(http.getStream(), rxBuffer, sizeof(rxBuffer),
-                            ADSB_HTTP_TIMEOUT_MS);
+                            httpTimeoutMs());
     const DeserializationError err = deserializeJson(
         doc, buffered, DeserializationOption::Filter(filter));
     http.end();
@@ -324,7 +356,7 @@ FetchStats runFetch(WiFiClient &client, const char *url, Tracker &tracker,
         // MAX_AIRCRAFT slot a nearby one needs. Targets with no position are
         // kept regardless -- they cannot be plotted, but they still belong in
         // the list, and that is what the aggregators return too.
-        if (kAdsbLocal && parsed.hasPosition &&
+        if (isLocal() && parsed.hasPosition &&
             geo::distanceNm(lat, lon, parsed.lat, parsed.lon) > filterRadiusNm) {
             ++stats.filtered;
             continue;
@@ -354,7 +386,7 @@ FetchStats fetch(Tracker &tracker, double lat, double lon, uint16_t radiusNm) {
         gLastStats = stats;
         return stats;
     }
-    if (gLastAttemptMs != 0 && started - gLastAttemptMs < ADSB_POLL_MIN_INTERVAL_MS) {
+    if (gLastAttemptMs != 0 && started - gLastAttemptMs < minIntervalMs()) {
         stats.result = Result::RateLimited;
         return stats;  // deliberately does not overwrite gLastStats
     }
@@ -370,9 +402,11 @@ FetchStats fetch(Tracker &tracker, double lat, double lon, uint16_t radiusNm) {
     // in the request, no certificate anybody could usefully check, and the
     // handshake we skip is the most expensive part of a poll -- it dominated
     // the 1.3-1.5 s an aggregator fetch used to take, and it churned tens of
-    // kilobytes of mbedtls heap every time. `if constexpr` keeps the unused
-    // client from being constructed at all.
-    if constexpr (kAdsbLocal) {
+    // kilobytes of mbedtls heap every time. Only the branch actually taken
+    // constructs a client, so a local poll never touches mbedtls -- but both
+    // branches are compiled now that the choice is a runtime one, which is
+    // what the TLS stack costs us in flash.
+    if (isLocal()) {
         WiFiClient client;
         stats = runFetch(client, url, tracker, lat, lon, radiusNm, started);
     } else {
@@ -383,7 +417,7 @@ FetchStats fetch(Tracker &tracker, double lat, double lon, uint16_t radiusNm) {
         // silently expires; nothing secret is sent and the payload is
         // sanity-checked after parsing.
         client.setInsecure();
-        client.setTimeout(ADSB_HTTP_TIMEOUT_MS / 1000);
+        client.setTimeout(httpTimeoutMs() / 1000);
         stats = runFetch(client, url, tracker, lat, lon, radiusNm, started);
     }
 

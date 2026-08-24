@@ -2,6 +2,7 @@
 
 #include <stdint.h>
 
+#include "config.h"
 #include "core/tracker.h"
 
 namespace adsb {
@@ -24,7 +25,27 @@ struct FetchStats {
     uint32_t bytes = 0;
 };
 
-// Human-readable name of the configured provider, for the status bar.
+// Which feed is in use. Runtime rather than compile-time so the 'p' key can
+// swap between your own receiver and a public aggregator without a reflash --
+// the local one is fresher and free, the aggregator sees past your antenna's
+// horizon and keeps working away from home. Resets to ADSB_PROVIDER_DEFAULT on
+// reboot; there is no NVS yet.
+AdsbProvider provider();
+void setProvider(AdsbProvider p);
+
+// Swap between the local receiver and ADSB_PROVIDER_REMOTE.
+void toggleProvider();
+
+// True when the current feed is our own receiver: plain HTTP rather than TLS,
+// and a client-side radius filter because it serves everything it hears.
+bool isLocal();
+
+// Poll cadence for the current feed, from the ADSB_LOCAL_* / ADSB_REMOTE_*
+// settings in config.h.
+uint32_t pollIntervalMs();
+uint32_t minIntervalMs();
+
+// Human-readable name of the current provider, for the status bar.
 const char *providerName();
 
 // Query the feed for traffic within `radiusNm` of (lat, lon) and merge it

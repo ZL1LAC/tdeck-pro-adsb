@@ -33,11 +33,14 @@
 // registration and type designator, which aircraft.json does not carry.
 enum class AdsbProvider : uint8_t { ADSB_LOL, ADSB_FI, AIRPLANES_LIVE, LOCAL };
 
-#define ADSB_PROVIDER AdsbProvider::LOCAL
-
-// True when the feed is our own receiver on the LAN. Drives the transport
-// (plain HTTP rather than TLS) and the timings below.
-static constexpr bool kAdsbLocal = (ADSB_PROVIDER == AdsbProvider::LOCAL);
+// Which feed the firmware starts on, and which aggregator the 'p' key swaps
+// to. The choice is made at runtime rather than compiled in, so both
+// transports have to be linked: that costs about 120 KB of flash in mbedtls
+// which a LOCAL-only build does not pay. Worth it for being able to walk out
+// of Wi-Fi range and still see traffic. There is no NVS yet, so a toggle lasts
+// until the next reboot.
+#define ADSB_PROVIDER_DEFAULT AdsbProvider::LOCAL
+#define ADSB_PROVIDER_REMOTE  AdsbProvider::ADSB_FI
 
 // Sent so feed operators can identify (and contact) misbehaving clients.
 #define ADSB_USER_AGENT "tdeckpro-adsb/0.1 (+https://github.com/)"
@@ -58,13 +61,15 @@ static constexpr bool kAdsbLocal = (ADSB_PROVIDER == AdsbProvider::LOCAL);
 // just above EPD_MIN_REFRESH_INTERVAL_MS, which is as fast as the glass can
 // show a change anyway. The timeout drops with it: a LAN round trip that has
 // not answered in 3 s is not going to.
-static constexpr uint32_t kAdsbPollIntervalMs    = kAdsbLocal ?  5000UL : 15000UL;
-static constexpr uint32_t kAdsbPollMinIntervalMs = kAdsbLocal ?  2000UL :  5000UL;
-static constexpr uint32_t kAdsbHttpTimeoutMs     = kAdsbLocal ?  3000UL : 12000UL;
+// Your own receiver: the limit is the panel, not politeness.
+#define ADSB_LOCAL_POLL_INTERVAL_MS   5000UL
+#define ADSB_LOCAL_MIN_INTERVAL_MS    2000UL
+#define ADSB_LOCAL_HTTP_TIMEOUT_MS    3000UL
 
-#define ADSB_POLL_INTERVAL_MS     kAdsbPollIntervalMs
-#define ADSB_POLL_MIN_INTERVAL_MS kAdsbPollMinIntervalMs
-#define ADSB_HTTP_TIMEOUT_MS      kAdsbHttpTimeoutMs
+// A public aggregator: volunteer-run, so be polite.
+#define ADSB_REMOTE_POLL_INTERVAL_MS 15000UL
+#define ADSB_REMOTE_MIN_INTERVAL_MS   5000UL
+#define ADSB_REMOTE_HTTP_TIMEOUT_MS  12000UL
 
 // Drop an aircraft from the local store once we have not seen it for this long.
 #define AIRCRAFT_STALE_MS 90000UL
