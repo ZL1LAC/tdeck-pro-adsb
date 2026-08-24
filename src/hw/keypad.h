@@ -21,6 +21,20 @@ constexpr char kSpace = ' ';
 
 // Returns false if the TCA8418 did not answer on the I2C bus, in which case
 // poll() will always report "no key" and the UI falls back to touch only.
+// The most recent key event, shown on the diagnostics page.
+//
+// This keymap is transcribed from LilyGO's factory example and the board it
+// was transcribed for may not be the board you have, so the firmware has to be
+// able to tell you what a key actually reported rather than leaving you to
+// guess. `row` and `col` are -1 when the decode rejected the event outright.
+struct LastKey {
+    char c;
+    int8_t row;
+    int8_t col;
+    int16_t raw;
+};
+const LastKey &lastKey();
+
 bool begin();
 bool present();
 

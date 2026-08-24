@@ -87,6 +87,21 @@ enum class AdsbProvider : uint8_t { ADSB_LOL, ADSB_FI, AIRPLANES_LIVE, LOCAL };
 #define GNSS_ENABLED true
 #define GNSS_CENTRE_BY_DEFAULT true
 
+// GNSS duty cycle. The module is the largest continuous draw on the board and
+// the position it reports barely changes, so it is not held powered for its
+// own sake: when nothing is reading a position -- the plot is centred on the
+// configured home and the clock is already set -- the rail is simply switched
+// off. When something is, the module runs only long enough to produce a fix.
+//
+// GNSS_FIX_HOLD_MS is how long a fix stays usable after the module powers
+// down, and must comfortably exceed one sleep plus one acquisition, or a slow
+// acquisition would let it expire and bounce the plot back to the configured
+// home before the replacement lands.
+#define GNSS_SLEEP_MS       120000UL  // between successful fixes
+#define GNSS_ACQUIRE_MAX_MS  90000UL  // give up on an acquisition
+#define GNSS_RETRY_MS       300000UL  // back off after giving up
+#define GNSS_FIX_HOLD_MS    900000UL  // a fix stays usable this long
+
 // ================================================================== Map =====
 // Vector basemap: coastline, airports and (optionally) airspace, drawn under
 // the radar plot. Built offline and flashed separately from the firmware:

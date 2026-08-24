@@ -245,6 +245,13 @@ void loop() {
     refreshBattery();
     settings::poll();
 
+    // The only consumers of a GNSS position are the plot centre and, until it
+    // is set, the clock. When neither wants one the module is powered down
+    // rather than duty cycled, which is the whole saving rather than most of
+    // it. Evaluated here rather than in the fast path because it cannot change
+    // faster than a keypress.
+    gnss::setNeeded(ui::centreOnGnss() || !wallclock::valid());
+
     double lat = 0.0, lon = 0.0;
     bool fromGnss = false;
     ownPosition(&lat, &lon, &fromGnss);

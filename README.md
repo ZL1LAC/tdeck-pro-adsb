@@ -413,6 +413,41 @@ what a mistaken winding rule looks like.
 > committed here for that reason -- the script fetches it, and `data/icons.bin`
 > is gitignored with the other generated blobs.
 
+## GNSS power
+
+The MIA-M10Q is the largest continuous draw on the board, and it is powered for
+a position that barely changes. So it is not held on for its own sake.
+
+**When nothing is reading a position, the rail is simply off.** The only
+consumers are the plot centre and — until it is set — the clock, so if you are
+centred on the configured home and the clock has come from SNTP or the retained
+RTC, the module never powers up at all. That is the whole saving rather than a
+fraction of it, and it costs nothing, because a position nobody reads is worth
+no power whatsoever.
+
+**When something is reading one, the module is cycled**: acquire a fix, switch
+the rail off, wake `GNSS_SLEEP_MS` later and do it again. An acquisition that
+gets nowhere within `GNSS_ACQUIRE_MAX_MS` gives up and backs off for
+`GNSS_RETRY_MS` rather than sitting there drawing current under a roof.
+
+The subtlety is that `hasFix()` deliberately outlives the module being powered.
+A fix stays usable for `GNSS_FIX_HOLD_MS`, which has to comfortably exceed one
+sleep plus one acquisition — otherwise the held fix would expire mid-cycle, the
+plot centre would snap back to the configured home, and the next fix would snap
+it back again. A device that jumps between two positions every two minutes is
+worse than one that never duty-cycled at all.
+
+The diagnostics page reports `GNSS pwr` (on, or seconds until the next
+acquisition, with the running duty cycle) and `Last TTFF`. Watch the TTFF: it
+decides whether this is winning. A module that keeps its ephemeris across the
+sleep re-fixes in a second or two and the duty cycle collapses to almost
+nothing; one that cold starts every time takes half a minute and saves much
+less. If yours cold starts, lengthen `GNSS_SLEEP_MS`.
+
+> The ~30 mA figure quoted for this module is from the vendor, not measured
+> here. Measuring it needs a battery run: the BQ27220 reports *battery*
+> current, so with USB plugged in it shows charging rather than load.
+
 ## Settings that survive a reboot
 
 Range, basemap on/off, GNSS centring, keyboard backlight and the chosen feed are
@@ -554,13 +589,11 @@ latency nobody is watching for.
 - Touch axis orientation is unverified on hardware. If taps land transposed or
   mirrored — or dragging pans the wrong way — flip `kSwapXY` / `kMirrorX` /
   `kMirrorY` in [touch.cpp](src/hw/touch.cpp).
-- No sleep of any kind. The Arduino libraries ship without `CONFIG_PM_ENABLE`,
-  so automatic light sleep and DFS are unavailable without rebuilding the
+- No CPU sleep. The Arduino libraries ship without `CONFIG_PM_ENABLE`, so
+  automatic light sleep and DFS are unavailable without rebuilding the
   framework, and manual `esp_light_sleep_start()` with the station associated
   risks losing beacons. The CPU therefore never idles below 80 MHz, which is
-  the floor on what this can draw. Duty-cycling the GNSS — it is powered
-  continuously for a position that barely moves — is the next thing worth
-  doing.
+  the floor on what this can draw.
 - Airspace has no automatic data source; you have to supply an OpenAir file,
   and the only one indexed for New Zealand is several years stale.
 - The basemap has no roads or terrain, and no altitude filtering — an airspace

@@ -12,12 +12,15 @@ namespace {
 constexpr uint8_t kRows = 4;
 constexpr uint8_t kCols = 10;
 
-// The TCA8418 FIFO encodes key-down as 129..163 and key-up as 1..35, both
-// offset from a row-major key index. Column order is reversed on this board.
+// The TCA8418 FIFO reports a key index with bit 7 set for a press and clear
+// for a release. The index is always row-major over ten columns whatever the
+// matrix is configured as, so a 4x10 board spans keys 1..40 -- presses
+// 129..168, releases 1..40. The ceiling used to be hard-coded at 163, which
+// silently discarded the last five keys of the matrix as "not a press".
 constexpr int kPressMin = 129;
-constexpr int kPressMax = 163;
+constexpr int kPressMax = kPressMin + kRows * kCols - 1;
 constexpr int kReleaseMin = 1;
-constexpr int kReleaseMax = 35;
+constexpr int kReleaseMax = kRows * kCols;
 
 const char kKeymap[kRows][kCols] = {
     {'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p'},
@@ -29,6 +32,8 @@ const char kKeymap[kRows][kCols] = {
 // The matrix is read over the same I2C bus as the touch panel and the PMU;
 // checking it every loop iteration was pure bus traffic for no benefit.
 constexpr uint32_t kPollIntervalMs = 25;
+
+LastKey gLastKey = {0, -1, -1, 0};
 
 Adafruit_TCA8418 gDevice;
 bool gPresent = false;
@@ -50,6 +55,8 @@ bool begin() {
 
 bool present() { return gPresent; }
 
+const LastKey &lastKey() { return gLastKey; }
+
 char poll() {
     if (!gPresent) return 0;
 
@@ -64,16 +71,23 @@ char poll() {
         // Key-up (or a GPI event we did not ask for): consume and ignore.
         (void)kReleaseMin;
         (void)kReleaseMax;
+        gLastKey = {0, -1, -1, static_cast<int16_t>(event)};
+        log_d("keypad: ignored raw=%d", event);
         return 0;
     }
 
     const int key = event - kPressMin;
     const int row = key / kCols;
     const int col = (kCols - 1) - (key % kCols);
-    if (row < 0 || row >= kRows || col < 0 || col >= kCols) return 0;
+    if (row < 0 || row >= kRows || col < 0 || col >= kCols) {
+        log_d("keypad: out of range raw=%d -> (%d,%d)", event, row, col);
+        return 0;
+    }
 
     const char c = kKeymap[row][col];
-    log_d("keypad: '%c' (%d,%d)", c, row, col);
+    gLastKey = {c, static_cast<int8_t>(row), static_cast<int8_t>(col),
+                static_cast<int16_t>(event)};
+    log_d("keypad: '%c' (%d,%d) raw=%d", c, row, col, event);
     return c;
 }
 

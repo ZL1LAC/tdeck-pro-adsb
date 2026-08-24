@@ -15,6 +15,7 @@
 #include "display.h"
 #include "icons.h"
 #include "hw/clock.h"
+#include "hw/gnss.h"
 #include "hw/keypad.h"
 #include "hw/power.h"
 
@@ -976,6 +977,46 @@ void drawStatus() {
              gCtx.touchPresent ? "touch" : "NO touch");
     row("Input", buf);
 
+    // What the last key actually reported. The keymap in keypad.cpp came from
+    // LilyGO's factory example and may not match the board in your hands, so
+    // this is how you find out what to change it to: press a key here and read
+    // off the character it produced and where the controller says it was.
+    const keypad::LastKey &lk = keypad::lastKey();
+    if (lk.raw == 0) {
+        snprintf(buf, sizeof(buf), "press one");
+    } else if (lk.row < 0) {
+        snprintf(buf, sizeof(buf), "raw %d dropped", static_cast<int>(lk.raw));
+    } else {
+        snprintf(buf, sizeof(buf), "'%c' r%d c%d raw%d", lk.c,
+                 static_cast<int>(lk.row), static_cast<int>(lk.col),
+                 static_cast<int>(lk.raw));
+    }
+    row("Last key", buf);
+
+    // Whether duty cycling is actually winning. A module that keeps its
+    // ephemeris across the sleep re-fixes in a second or two; one that cold
+    // starts every time takes half a minute and saves far less, and the only
+    // way to tell the two apart is to watch the numbers.
+    if (gCtx.gnssEnabled) {
+        if (gnss::powered()) {
+            snprintf(buf, sizeof(buf), "on  %u%% duty",
+                     static_cast<unsigned>(gnss::dutyPercent()));
+        } else if (gnss::sleepRemainingMs() > 0) {
+            snprintf(buf, sizeof(buf), "%us  %u%% duty",
+                     static_cast<unsigned>(gnss::sleepRemainingMs() / 1000),
+                     static_cast<unsigned>(gnss::dutyPercent()));
+        } else {
+            snprintf(buf, sizeof(buf), "off, unused");
+        }
+        row("GNSS pwr", buf);
+
+        if (gnss::lastTtffMs() > 0) {
+            snprintf(buf, sizeof(buf), "%.1f s",
+                     gnss::lastTtffMs() / 1000.0f);
+            row("Last TTFF", buf);
+        }
+    }
+
     row("AC db", aircraftdb::status());
     row("Icons", icons::status());
     row("Settings", settings::status());
@@ -1309,6 +1350,11 @@ bool tick() {
             ? static_cast<uint32_t>(gCtx.clockHour) * 60u + gCtx.clockMinute
             : 0xFFFFu);
     for (const char *p = gSelectedHex; *p; ++p) mix(static_cast<uint8_t>(*p));
+    // Only on the diagnostics page, where the last key is on screen: elsewhere
+    // this would repaint the panel for a keypress that changed nothing.
+    if (gView == View::Status) {
+        mix(static_cast<uint32_t>(keypad::lastKey().raw));
+    }
 
     return display::render(h, drawCurrentView);
 }
