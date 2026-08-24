@@ -26,3 +26,13 @@ static const size_t kWifiNetworkCount =
 // is false in config.h. This one is Auckland; replace it with yours.
 #define HOME_LATITUDE  -36.848460
 #define HOME_LONGITUDE 174.763332
+
+// ---------------------------------------------------------- local feed -----
+// Optional: your own Raspberry Pi receiver, if you have one. Only used when
+// config.h sets ADSB_PROVIDER to AdsbProvider::LOCAL. Find the right path by
+// opening the map in a browser -- the usual ones are:
+//
+//     http://<pi>/tar1090/data/aircraft.json        readsb + tar1090
+//     http://<pi>/skyaware/data/aircraft.json       piaware / dump1090-fa
+//     http://<pi>:8080/data/aircraft.json           readsb standalone
+#define ADSB_LOCAL_URL "http://192.168.1.10/tar1090/data/aircraft.json"

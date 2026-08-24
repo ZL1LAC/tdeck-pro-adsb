@@ -8,6 +8,7 @@
 #include <string.h>
 
 #include "config.h"
+#include "core/geo.h"
 
 namespace adsb {
 namespace {
@@ -35,11 +36,25 @@ struct PsramAllocator : ArduinoJson::Allocator {
 };
 
 const char *arrayKey() {
-    return (ADSB_PROVIDER == AdsbProvider::ADSB_FI) ? "aircraft" : "ac";
+    // readsb and adsb.fi both name it "aircraft"; adsb.lol and airplanes.live
+    // shorten it to "ac".
+    return (ADSB_PROVIDER == AdsbProvider::ADSB_FI ||
+            ADSB_PROVIDER == AdsbProvider::LOCAL)
+               ? "aircraft"
+               : "ac";
 }
 
 void buildUrl(char *out, size_t len, double lat, double lon, int radiusNm) {
     switch (ADSB_PROVIDER) {
+        case AdsbProvider::LOCAL:
+            // A receiver's aircraft.json is a fixed path holding everything it
+            // currently hears -- there is nothing to parameterise, and the
+            // radius is applied client-side after parsing instead.
+            (void)lat;
+            (void)lon;
+            (void)radiusNm;
+            snprintf(out, len, "%s", ADSB_LOCAL_URL);
+            break;
         case AdsbProvider::ADSB_FI:
             snprintf(out, len,
                      "https://opendata.adsb.fi/api/v2/lat/%.4f/lon/%.4f/dist/%d",
@@ -224,6 +239,7 @@ bool decodeAircraft(JsonObjectConst src, Aircraft *out) {
 
 const char *providerName() {
     switch (ADSB_PROVIDER) {
+        case AdsbProvider::LOCAL: return "local rx";
         case AdsbProvider::ADSB_FI: return "adsb.fi";
         case AdsbProvider::AIRPLANES_LIVE: return "airplanes.live";
         case AdsbProvider::ADSB_LOL:
@@ -231,34 +247,15 @@ const char *providerName() {
     }
 }
 
-FetchStats fetch(Tracker &tracker, double lat, double lon, uint16_t radiusNm) {
+namespace {
+
+// Everything from the GET to the merge, once a transport has been chosen.
+// Split out so the plain-HTTP and TLS paths can share it without either one
+// paying to construct the other's client.
+FetchStats runFetch(WiFiClient &client, const char *url, Tracker &tracker,
+                    double lat, double lon, uint16_t radiusNm,
+                    uint32_t started) {
     FetchStats stats;
-    const uint32_t started = millis();
-
-    if (WiFi.status() != WL_CONNECTED) {
-        stats.result = Result::NotConnected;
-        gLastStats = stats;
-        return stats;
-    }
-    if (gLastAttemptMs != 0 && started - gLastAttemptMs < ADSB_POLL_MIN_INTERVAL_MS) {
-        stats.result = Result::RateLimited;
-        return stats;  // deliberately does not overwrite gLastStats
-    }
-    gLastAttemptMs = started;
-
-    if (radiusNm < 1) radiusNm = 1;
-    if (radiusNm > kMaxRadiusNm) radiusNm = kMaxRadiusNm;
-
-    char url[160];
-    buildUrl(url, sizeof(url), lat, lon, radiusNm);
-
-    WiFiClientSecure client;
-    // These are public, read-only, unauthenticated feeds and the board has no
-    // way to refresh a pinned root as the providers rotate certificates. We
-    // accept any certificate rather than ship a root that silently expires;
-    // nothing secret is sent and the payload is sanity-checked after parsing.
-    client.setInsecure();
-    client.setTimeout(ADSB_HTTP_TIMEOUT_MS / 1000);
 
     HTTPClient http;
     http.setTimeout(ADSB_HTTP_TIMEOUT_MS);
@@ -269,18 +266,19 @@ FetchStats fetch(Tracker &tracker, double lat, double lon, uint16_t radiusNm) {
 
     if (!http.begin(client, url)) {
         stats.result = Result::HttpError;
-        gLastStats = stats;
         return stats;
     }
     http.addHeader("User-Agent", ADSB_USER_AGENT);
     http.addHeader("Accept", "application/json");
+    // The lighttpd that fronts tar1090 will gzip JSON if a client says it can
+    // take it, and we have no decompressor -- so say we cannot.
+    http.addHeader("Accept-Encoding", "identity");
 
     stats.httpStatus = http.GET();
     if (stats.httpStatus != HTTP_CODE_OK) {
         log_w("adsb: HTTP %d from %s", stats.httpStatus, providerName());
         stats.result = Result::HttpError;
         http.end();
-        gLastStats = stats;
         return stats;
     }
     const int contentLength = http.getSize();
@@ -303,7 +301,6 @@ FetchStats fetch(Tracker &tracker, double lat, double lon, uint16_t radiusNm) {
     if (err) {
         log_w("adsb: parse failed: %s", err.c_str());
         stats.result = Result::ParseError;
-        gLastStats = stats;
         return stats;
     }
 
@@ -311,15 +308,28 @@ FetchStats fetch(Tracker &tracker, double lat, double lon, uint16_t radiusNm) {
     if (list.isNull()) {
         log_w("adsb: response carried no aircraft array");
         stats.result = Result::ParseError;
-        gLastStats = stats;
         return stats;
     }
 
     const uint32_t now = millis();
+    const float filterRadiusNm = static_cast<float>(radiusNm);
     Aircraft parsed;
     for (JsonObjectConst item : list) {
         ++stats.received;
         if (!decodeAircraft(item, &parsed)) continue;
+
+        // A local aircraft.json is unfiltered: it carries every target the
+        // receiver hears, which at altitude reaches far past anything the plot
+        // will show. Applying the radius here stops a distant one taking a
+        // MAX_AIRCRAFT slot a nearby one needs. Targets with no position are
+        // kept regardless -- they cannot be plotted, but they still belong in
+        // the list, and that is what the aggregators return too.
+        if (kAdsbLocal && parsed.hasPosition &&
+            geo::distanceNm(lat, lon, parsed.lat, parsed.lon) > filterRadiusNm) {
+            ++stats.filtered;
+            continue;
+        }
+
         if (!tracker.upsert(parsed, now)) {
             log_w("adsb: tracker full at %d aircraft; dropping the rest",
                   MAX_AIRCRAFT);
@@ -330,11 +340,62 @@ FetchStats fetch(Tracker &tracker, double lat, double lon, uint16_t radiusNm) {
 
     stats.result = Result::Ok;
     stats.durationMs = millis() - started;
-    gLastSuccessMs = millis();
-    gLastStats = stats;
-    log_i("adsb: %u aircraft in %ums", stats.stored, stats.durationMs);
     return stats;
 }
+
+}  // namespace
+
+FetchStats fetch(Tracker &tracker, double lat, double lon, uint16_t radiusNm) {
+    FetchStats stats;
+    const uint32_t started = millis();
+
+    if (WiFi.status() != WL_CONNECTED) {
+        stats.result = Result::NotConnected;
+        gLastStats = stats;
+        return stats;
+    }
+    if (gLastAttemptMs != 0 && started - gLastAttemptMs < ADSB_POLL_MIN_INTERVAL_MS) {
+        stats.result = Result::RateLimited;
+        return stats;  // deliberately does not overwrite gLastStats
+    }
+    gLastAttemptMs = started;
+
+    if (radiusNm < 1) radiusNm = 1;
+    if (radiusNm > kMaxRadiusNm) radiusNm = kMaxRadiusNm;
+
+    char url[160];
+    buildUrl(url, sizeof(url), lat, lon, radiusNm);
+
+    // Transport. A receiver on the LAN is plain HTTP: there is nothing secret
+    // in the request, no certificate anybody could usefully check, and the
+    // handshake we skip is the most expensive part of a poll -- it dominated
+    // the 1.3-1.5 s an aggregator fetch used to take, and it churned tens of
+    // kilobytes of mbedtls heap every time. `if constexpr` keeps the unused
+    // client from being constructed at all.
+    if constexpr (kAdsbLocal) {
+        WiFiClient client;
+        stats = runFetch(client, url, tracker, lat, lon, radiusNm, started);
+    } else {
+        WiFiClientSecure client;
+        // These are public, read-only, unauthenticated feeds and the board has
+        // no way to refresh a pinned root as the providers rotate
+        // certificates. We accept any certificate rather than ship a root that
+        // silently expires; nothing secret is sent and the payload is
+        // sanity-checked after parsing.
+        client.setInsecure();
+        client.setTimeout(ADSB_HTTP_TIMEOUT_MS / 1000);
+        stats = runFetch(client, url, tracker, lat, lon, radiusNm, started);
+    }
+
+    if (stats.result == Result::Ok) {
+        gLastSuccessMs = millis();
+        log_i("adsb: %u aircraft in %ums (%u filtered)", stats.stored,
+              stats.durationMs, stats.filtered);
+    }
+    gLastStats = stats;
+    return stats;
+}
+
 
 uint32_t lastSuccessMs() { return gLastSuccessMs; }
 const FetchStats &lastStats() { return gLastStats; }

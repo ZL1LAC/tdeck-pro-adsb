@@ -19,6 +19,7 @@ struct FetchStats {
     int httpStatus = 0;
     uint16_t received = 0;   // aircraft objects in the response
     uint16_t stored = 0;     // how many made it into the tracker
+    uint16_t filtered = 0;   // dropped as beyond the query radius (local feed)
     uint32_t durationMs = 0;
     uint32_t bytes = 0;
 };
@@ -27,7 +28,9 @@ struct FetchStats {
 const char *providerName();
 
 // Query the feed for traffic within `radiusNm` of (lat, lon) and merge it
-// into `tracker`. The public endpoints cap the radius at 250 nm.
+// into `tracker`. The public endpoints cap the radius at 250 nm and filter
+// server-side; a local receiver serves everything it hears, so there the
+// radius is applied here instead.
 //
 // Blocking: expect 0.3-3 s depending on link quality. Only merges -- the
 // caller must call `tracker.finishUpdate()` afterwards with its OWN position,

@@ -788,7 +788,16 @@ void drawStatus() {
     const adsb::FetchStats &f = gCtx.lastFetch;
     switch (f.result) {
         case adsb::Result::Ok:
-            snprintf(buf, sizeof(buf), "ok %u ac", static_cast<unsigned>(f.stored));
+            // A local receiver serves everything it hears, so the count it
+            // sent and the count we kept are different numbers worth seeing.
+            if (f.filtered > 0) {
+                snprintf(buf, sizeof(buf), "ok %u ac -%u far",
+                         static_cast<unsigned>(f.stored),
+                         static_cast<unsigned>(f.filtered));
+            } else {
+                snprintf(buf, sizeof(buf), "ok %u ac",
+                         static_cast<unsigned>(f.stored));
+            }
             break;
         case adsb::Result::HttpError:
             snprintf(buf, sizeof(buf), "HTTP %d", f.httpStatus);

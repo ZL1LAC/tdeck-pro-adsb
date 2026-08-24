@@ -139,18 +139,56 @@ actually fetches traffic there rather than showing an empty circle.
 
 ## Data feeds
 
-Three key-less public aggregators are supported; pick one with `ADSB_PROVIDER`.
+Your own receiver, or one of three key-less public aggregators. Pick with
+`ADSB_PROVIDER`.
 
 | Provider | Endpoint | Notes |
 | --- | --- | --- |
-| `ADSB_FI` (default) | `opendata.adsb.fi` | Includes the `desc` type description |
+| `LOCAL` (default) | `ADSB_LOCAL_URL` in secrets.h | Your Pi. Plain HTTP, sub-second positions |
+| `ADSB_FI` | `opendata.adsb.fi` | Includes the `desc` type description |
 | `ADSB_LOL` | `api.adsb.lol` | No published rate limit |
 | `AIRPLANES_LIVE` | `api.airplanes.live` | Asks for ≤ 1 request/second |
 
-All three return readsb-shaped JSON and differ only in URL layout and in the
-name of the aircraft array. The query radius follows whatever range the radar is
-showing (floored at `ADSB_QUERY_RADIUS_NM`, capped at the providers' 250 nm),
-so zooming out actually pulls in more traffic.
+All four serve the same readsb-shaped JSON, so one parser and one field filter
+cover the lot; they differ only in URL layout and in whether the array is called
+`aircraft` or `ac`.
+
+### Feeding from your own receiver
+
+If you run dump1090, readsb or PiAware, the decoded state it already publishes
+is a better source than any aggregator. Point `ADSB_LOCAL_URL` at its
+`aircraft.json` — the usual paths are `/tar1090/data/aircraft.json`,
+`/skyaware/data/aircraft.json`, or `:8080/data/aircraft.json` — and the firmware
+polls that instead.
+
+What it buys, against a public aggregator:
+
+- **Positions under a second old** (`seen_pos` is typically 0.2–0.5 s) rather
+  than several, refreshed at 1 Hz, so `ADSB_POLL_INTERVAL_MS` drops to 5 s.
+- **A few kilobytes per poll** instead of a few hundred.
+- **No TLS.** The handshake was the most expensive part of a poll — it dominated
+  the 1.3–1.5 s an aggregator fetch took and churned tens of kilobytes of
+  mbedtls heap every time. Skipping it also lets the linker drop mbedtls
+  altogether, which is worth 121 KB of flash.
+- **No rate limit, and no internet.** It keeps working when the WAN is down.
+
+What it costs:
+
+- **Coverage stops at your antenna's horizon.** The aggregators pool every
+  receiver in the country; you see what you can hear.
+- **No registration or type designator.** `aircraft.json` carries neither unless
+  readsb is run with a `--db-file`, so those columns sit empty. Note the trap:
+  there *is* a `type` field, but it holds `adsb_icao` — the message source, not
+  the airframe.
+- **It only exists on your own network.** Carry the board out of range and the
+  feed goes quiet until you switch `ADSB_PROVIDER` back.
+
+A local `aircraft.json` also has no radius parameter — it carries everything the
+receiver hears — so `ADSB_QUERY_RADIUS_NM` is applied client-side after parsing
+instead of by the server. Either way the radius follows whatever range the radar
+is showing, so zooming out pulls in more traffic.
+
+### Against an aggregator
 
 Please keep `ADSB_POLL_INTERVAL_MS` sensible — these are volunteer-run feeds,
 and the e-paper cannot repaint faster than about 1.5 Hz anyway.
@@ -159,6 +197,18 @@ TLS uses `setInsecure()`. The payload is public, read-only and unauthenticated,
 and a pinned root baked into flash would silently expire the first time a
 provider rotated certificates. If you would rather pin one, do it in
 [adsb_source.cpp](src/net/adsb_source.cpp).
+
+### Why not Beast?
+
+Port 30005 carries raw Mode S frames, and decoding them on the ESP32 would mean
+CRC-24 with address overlay, CPR even/odd position decoding, the 12-bit altitude
+field with its Q-bit split, the 6-bit callsign charset and the velocity
+subtypes — several hundred lines re-deriving what the Pi has already computed.
+The deeper problem is that Beast is a stream of *events* where the display wants
+*state*: you only learn about an aircraft when it next transmits, so a reconnect
+leaves the radar empty and fills it over ~30 s, while one GET of `aircraft.json`
+returns the receiver's whole accumulated picture. A persistent socket also wakes
+the Wi-Fi modem on every frame, where polling lets it idle in between.
 
 ## Basemap
 
@@ -321,13 +371,16 @@ UART, I2C and SPI peripherals need no re-tuning across the change.
 ## Current footprint
 
 ```
-RAM:   21.3% (69,744 / 327,680 bytes)
-Flash: 15.6% (1,019,413 / 6,553,600 bytes)
+RAM:   21.0% (68,796 / 327,680 bytes)
+Flash: 13.7% (898,381 / 6,553,600 bytes)     -- LOCAL feed; mbedtls unlinked
+Flash: 15.6% (1,019,469 / 6,553,600 bytes)   -- aggregator feed, with TLS
 SPIFFS: 73 KB of 3.4 MB used by the basemap (coast + airports + airspace)
 ```
 
-Measured on hardware: ~29 aircraft per poll, 1.3–1.5 s per HTTPS fetch and
-parse, 651 ms partial / 1016 ms full panel refresh.
+Measured on hardware against an aggregator: ~29 aircraft per poll, 1.3–1.5 s per
+HTTPS fetch and parse, 651 ms partial / 1016 ms full panel refresh. The local
+path has not been timed on hardware yet; on the LAN it is a 5 KB plain-HTTP GET
+with no handshake, so the fetch should be a small fraction of that.
 
 ## Not done yet
 

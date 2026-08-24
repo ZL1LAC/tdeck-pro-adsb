@@ -16,27 +16,55 @@
 #define WIFI_CONNECT_TIMEOUT_MS 15000UL
 
 // ========================================================== Data source =====
-// Three free, key-less feeds. All return readsb-shaped JSON; they differ only
-// in URL layout and in the name of the aircraft array.
+// Your own receiver, or one of three free key-less aggregators. All of them
+// serve the same readsb-shaped JSON; they differ only in URL layout and in the
+// name of the aircraft array.
 //
+//   LOCAL           ADSB_LOCAL_URL      your Pi -- see secrets.h
 //   ADSB_LOL        api.adsb.lol        no published rate limit, no "desc" field
 //   ADSB_FI         opendata.adsb.fi    includes "desc" (type description)
 //   AIRPLANES_LIVE  api.airplanes.live  includes "desc", asks for <= 1 req/sec
-enum class AdsbProvider : uint8_t { ADSB_LOL, ADSB_FI, AIRPLANES_LIVE };
+//
+// LOCAL is worth having wherever it reaches. Positions are typically under a
+// second old rather than several, the response is a few kilobytes rather than
+// a few hundred, there is no TLS handshake and no rate limit, and it keeps
+// working with the internet down. What you give up is coverage beyond your own
+// antenna's horizon, and -- unless readsb runs with a --db-file -- the
+// registration and type designator, which aircraft.json does not carry.
+enum class AdsbProvider : uint8_t { ADSB_LOL, ADSB_FI, AIRPLANES_LIVE, LOCAL };
 
-#define ADSB_PROVIDER AdsbProvider::ADSB_FI
+#define ADSB_PROVIDER AdsbProvider::LOCAL
+
+// True when the feed is our own receiver on the LAN. Drives the transport
+// (plain HTTP rather than TLS) and the timings below.
+static constexpr bool kAdsbLocal = (ADSB_PROVIDER == AdsbProvider::LOCAL);
 
 // Sent so feed operators can identify (and contact) misbehaving clients.
 #define ADSB_USER_AGENT "tdeckpro-adsb/0.1 (+https://github.com/)"
 
-// Query radius in nautical miles. The public endpoints cap this at 250.
+// Query radius in nautical miles. The public endpoints cap this at 250 and
+// filter server-side. A local aircraft.json has no radius parameter -- it
+// carries everything the receiver hears -- so the same figure is applied as a
+// client-side filter instead, keeping distant traffic out of the MAX_AIRCRAFT
+// slots that nearby traffic needs.
 #define ADSB_QUERY_RADIUS_NM 60
 
-// How often to hit the API. The e-paper needs ~0.7 s per refresh, so polling
-// faster than ~10 s buys nothing but battery drain and rate-limit trouble.
-#define ADSB_POLL_INTERVAL_MS 15000UL
-#define ADSB_POLL_MIN_INTERVAL_MS 5000UL   // hard floor, also applies to manual refresh
-#define ADSB_HTTP_TIMEOUT_MS 12000UL
+// How often to hit the feed, and the hard floor a manual refresh cannot beat.
+//
+// Against an aggregator the limit is politeness: these are volunteer-run, and
+// the e-paper needs ~0.7 s per refresh, so polling faster than ~10 s buys
+// nothing but battery drain and rate-limit trouble. Against your own Pi there
+// is nobody to be polite to, so the limit becomes the panel itself -- 5 s sits
+// just above EPD_MIN_REFRESH_INTERVAL_MS, which is as fast as the glass can
+// show a change anyway. The timeout drops with it: a LAN round trip that has
+// not answered in 3 s is not going to.
+static constexpr uint32_t kAdsbPollIntervalMs    = kAdsbLocal ?  5000UL : 15000UL;
+static constexpr uint32_t kAdsbPollMinIntervalMs = kAdsbLocal ?  2000UL :  5000UL;
+static constexpr uint32_t kAdsbHttpTimeoutMs     = kAdsbLocal ?  3000UL : 12000UL;
+
+#define ADSB_POLL_INTERVAL_MS     kAdsbPollIntervalMs
+#define ADSB_POLL_MIN_INTERVAL_MS kAdsbPollMinIntervalMs
+#define ADSB_HTTP_TIMEOUT_MS      kAdsbHttpTimeoutMs
 
 // Drop an aircraft from the local store once we have not seen it for this long.
 #define AIRCRAFT_STALE_MS 90000UL
