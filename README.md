@@ -327,9 +327,26 @@ worth carrying.
 
 | Blocks | Records | On SPIFFS |
 | --- | --- | --- |
-| `C8` — New Zealand and Fiji | 4,898 | 77 KB |
-| `C8,7C` — adding Australia | 22,807 | 356 KB |
-| `all` | 615,897 | 9 MB — will not fit |
+| `C8` — New Zealand and Fiji | 4,898 | 172 KB |
+| `C8,7C` — adding Australia | 22,807 | 801 KB |
+| `all` | 615,897 | will not fit |
+
+Each record carries the registration, the ICAO type designator, a plain-English
+description, the year built and the operator. The description is what the detail
+page leads with — `BOEING 787-9 Dreamliner` rather than `B789` — and it is the
+reason the table is worth carrying at all, since no feed sends it.
+
+Descriptions are pooled rather than stored per aircraft: 20,475 aircraft in
+`C8,7C` share just 1,336 distinct ones between them, so the 1,308 Cessna 172s
+hold one copy of "CESSNA 172 Skyhawk" and a 16-bit index each. Inline, the same
+data would be 3.9 MB and would not fit.
+
+> **Operator and year are an Australian luxury.** The upstream database fills
+> them for 90% of `7C` registrations and for 1% of `C8` ones, so on New Zealand
+> traffic those two rows almost never appear while the operator names still cost
+> 227 KB of pool. `--no-operators` reclaims it. Note also that outside the
+> airlines an "operator" is usually a named private individual, which is worth a
+> thought before publishing a build.
 
 Pick by what actually turns up: a sample of one Auckland feed had five NZ and
 two Australian aircraft airborne at once, so `C8,7C` is the sensible default
@@ -367,7 +384,7 @@ src/
   main.cpp              orchestration: poll, gather context, render
   core/
     aircraft.h          one target, flat POD
-    aircraftdb.{h,cpp}  ICAO -> registration/type, binary search in PSRAM
+    aircraftdb.{h,cpp}  ICAO -> registration/type/description, binary search
     settings.{h,cpp}    the handful of choices worth keeping in NVS
     tracker.{h,cpp}     merge snapshots, age out, sort by range, scene hash
     geo.{h,cpp}         haversine, bearing, flat-earth projection, units
@@ -443,8 +460,8 @@ UART, I2C and SPI peripherals need no re-tuning across the change.
 ```
 RAM:   21.3% (69,928 / 327,680 bytes)
 Flash: 15.7% (1,026,645 / 6,553,600 bytes)
-SPIFFS: 73 KB basemap + 356 KB aircraft database, of 3.4 MB
-PSRAM:  356 KB, holding the aircraft database for the life of the run
+SPIFFS: 73 KB basemap + 801 KB aircraft database, of 3.4 MB
+PSRAM:  800 KB, holding the aircraft database for the life of the run
 
 Pinning ADSB_PROVIDER_DEFAULT to LOCAL and deleting the aggregator branch of
 adsb::fetch() drops mbedtls and takes flash to 13.7% (898,381 bytes).

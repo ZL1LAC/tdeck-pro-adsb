@@ -1,28 +1,28 @@
 #!/usr/bin/env python3
-"""Build the T-Deck Pro aircraft registration database.
+"""Build the T-Deck Pro aircraft database.
 
 Turns the public tar1090 aircraft database into data/aircraftdb.bin, which
 `pio run -t uploadfs` flashes into the SPIFFS partition alongside the basemap.
 The firmware loads it into PSRAM at boot and binary-searches it by ICAO address
-to fill in the registration and ICAO type designator.
+for the registration, type designator, description, year and operator.
 
-This exists because a local receiver's aircraft.json carries neither: readsb
-only serves them when it is started with a --db-file, and holding that database
-in readsb costs a Raspberry Pi around 50 MB of RAM. Doing the lookup on the
-device instead costs the Pi nothing.
+This exists because a local receiver's aircraft.json carries none of them:
+readsb only serves them when started with a --db-file, and holding that
+database in readsb costs a Raspberry Pi around 50 MB of RAM. Doing the lookup
+on the device instead costs the Pi nothing and needs no network -- the mapping
+is fixed, so there is nothing to keep fresh but a reflash.
 
 The whole database is 615k records and 30 MB uncompressed, which does not fit
 in a 3.4 MB SPIFFS partition and does not need to: an aircraft has to be within
 radio range to appear on the plot, so only the ICAO address blocks you can
-actually hear are worth carrying. New Zealand's C8 block is 4,898 records and
-78 KB.
+actually hear are worth carrying.
 
 Source: https://github.com/wiedehopf/tar1090-db (ODbL), fetched on demand and
 cached in tools/.dbcache. Only the Python standard library is used.
 
     python tools/build_db.py                       # New Zealand (C8)
     python tools/build_db.py --blocks C8,7C        # + Australia
-    python tools/build_db.py --blocks all          # everything that fits
+    python tools/build_db.py --blocks C8,7C --no-operators
 """
 
 import argparse
@@ -40,15 +40,21 @@ OUT = os.path.join(ROOT, 'data', 'aircraftdb.bin')
 DB_URL = 'https://github.com/wiedehopf/tar1090-db/raw/csv/aircraft.csv.gz'
 
 MAGIC = b'TDECKREG'
-VERSION = 1
+VERSION = 2
 
-# 3-byte ICAO + 8-byte registration + 4-byte type + 1 pad. Sixteen rather than
-# fifteen so that, with a 32-byte header, every record starts 16-byte aligned:
-# the firmware indexes straight into a PSRAM buffer and the odd byte is worth
-# less than the arithmetic it would cost.
+# 3-byte ICAO + 8-byte registration + 4-byte type + description index +
+# operator index + year + 3 pad = 24. The two text fields are indices into a
+# string table rather than inline text: the 20,475 aircraft in C8+7C share just
+# 1,336 distinct descriptions between them, so inlining would cost 3.9 MB and
+# not fit, where pooling costs 800 KB and does.
 REG_LEN, TYPE_LEN = 8, 4
-RECORD_LEN = 16
+RECORD_LEN = 24
 HEADER_LEN = 32
+NO_STRING = 0xFFFF
+
+# Covers every description in the source (the longest is 47) and keeps an
+# operator name to something a 40-column panel can show in two lines.
+MAX_TEXT = 47
 
 # The partition is 3.4 MB and the basemap already lives there.
 SPIFFS_BUDGET = 3 * 1024 * 1024
@@ -68,14 +74,15 @@ def fetch(url, name):
     return path
 
 
-def records(path, blocks):
-    """Yield (icao24, reg, type) for rows in the wanted ICAO blocks.
+def records(path, blocks, want_operators):
+    """Yield (icao, reg, type, desc, year, operator) for the wanted blocks.
 
     The file is semicolon-delimited and unquoted:
         hex;registration;type;flags;description;year;owner
-    Rows carrying neither a registration nor a type are dropped -- they are
-    placeholders, and a lookup that returns two empty strings is worse than a
-    miss because it stops the aggregator ever filling the fields in.
+
+    Rows carrying nothing usable are dropped. A lookup that returns only empty
+    strings is worse than a miss, because the firmware treats a hit as final
+    and would stop an aggregator ever filling the fields in.
     """
     kept = skipped = 0
     with gzip.open(path, 'rt', encoding='utf-8', errors='replace') as f:
@@ -84,6 +91,9 @@ def records(path, blocks):
             if len(parts) < 3:
                 continue
             hexid, reg, typ = parts[0].strip(), parts[1].strip(), parts[2].strip()
+            desc = parts[4].strip() if len(parts) > 4 else ''
+            year = parts[5].strip() if len(parts) > 5 else ''
+            oper = parts[6].strip() if len(parts) > 6 and want_operators else ''
             if len(hexid) != 6:
                 continue
             if blocks is not None and hexid[:2].upper() not in blocks:
@@ -92,7 +102,7 @@ def records(path, blocks):
                 icao = int(hexid, 16)
             except ValueError:
                 continue
-            if not reg and not typ:
+            if not reg and not typ and not desc:
                 skipped += 1
                 continue
             if len(reg) > REG_LEN or len(typ) > TYPE_LEN:
@@ -100,8 +110,14 @@ def records(path, blocks):
                 # worse than not having it. Long ones are rare enough to drop.
                 skipped += 1
                 continue
+            try:
+                yr = int(year)
+                if not 1900 <= yr <= 2100:
+                    yr = 0
+            except ValueError:
+                yr = 0
             kept += 1
-            yield icao, reg, typ
+            yield icao, reg, typ, desc[:MAX_TEXT], yr, oper[:MAX_TEXT]
     print(f'  kept {kept}, skipped {skipped} (empty or over-long)')
 
 
@@ -113,6 +129,10 @@ def main():
                          'e.g. "C8" for New Zealand, "C8,7C" to add Australia, '
                          'or "all" (default: C8)')
     ap.add_argument('--out', default=OUT)
+    ap.add_argument('--no-operators', action='store_true',
+                    help='drop the owner/operator column. Mostly private owners '
+                         'rather than airlines, and the bulk of the string pool, '
+                         'so this roughly halves the file')
     args = ap.parse_args()
 
     blocks = None if args.blocks.lower() == 'all' else {
@@ -122,36 +142,73 @@ def main():
     src = fetch(DB_URL, 'aircraft.csv.gz')
     print(f'  blocks: {"all" if blocks is None else ",".join(sorted(blocks))}')
 
-    rows = sorted(records(src, blocks), key=lambda r: r[0])
+    rows = sorted(records(src, blocks, not args.no_operators), key=lambda r: r[0])
     if not rows:
         sys.exit('no records matched -- check --blocks')
 
-    # The firmware binary-searches, so duplicates would make which one it finds
-    # depend on the search path. Last write wins, matching the CSV's own order.
+    # The firmware binary-searches, so a duplicate key would make which record
+    # it finds depend on the search path. Last write wins, as the CSV intends.
     deduped = {}
-    for icao, reg, typ in rows:
-        deduped[icao] = (reg, typ)
-    rows = [(k, v[0], v[1]) for k, v in sorted(deduped.items())]
+    for icao, reg, typ, desc, yr, oper in rows:
+        deduped[icao] = (reg, typ, desc, yr, oper)
+    rows = [(k,) + v for k, v in sorted(deduped.items())]
 
-    size = HEADER_LEN + len(rows) * RECORD_LEN
+    # One entry per distinct string, so the thousand-odd aircraft that are each
+    # a "CESSNA 172 Skyhawk" share a single copy of the words.
+    strings, seen = [], {}
+
+    def intern(text):
+        if not text:
+            return NO_STRING
+        i = seen.get(text)
+        if i is None:
+            i = seen[text] = len(strings)
+            strings.append(text)
+        return i
+
+    interned = [(icao, reg, typ, intern(desc), intern(oper), yr)
+                for icao, reg, typ, desc, yr, oper in rows]
+
+    if len(strings) >= NO_STRING:
+        sys.exit(f'{len(strings)} distinct strings will not fit a 16-bit index '
+                 f'-- narrow --blocks, or pass --no-operators')
+
+    blob = bytearray()
+    offsets = []
+    for text in strings:
+        offsets.append(len(blob))
+        blob += text.encode('ascii', 'replace') + b'\0'
+
+    strtab_off = HEADER_LEN + len(interned) * RECORD_LEN
+    pool_off = strtab_off + len(strings) * 4
+    size = pool_off + len(blob)
     if size > SPIFFS_BUDGET:
-        sys.exit(f'{size/1e6:.1f} MB exceeds the SPIFFS budget -- narrow --blocks')
+        sys.exit(f'{size/1e6:.1f} MB exceeds the SPIFFS budget -- narrow '
+                 f'--blocks, or pass --no-operators')
 
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     with open(args.out, 'wb') as f:
         header = (MAGIC
                   + struct.pack('<HH', VERSION, RECORD_LEN)
-                  + struct.pack('<I', len(rows))
+                  + struct.pack('<I', len(interned))
                   + struct.pack('<BBH', REG_LEN, TYPE_LEN, 0)
-                  + struct.pack('<I', 0))
+                  + struct.pack('<II', len(strings), strtab_off)
+                  + struct.pack('<I', pool_off))
         f.write(header.ljust(HEADER_LEN, b'\0'))
-        for icao, reg, typ in rows:
+        for icao, reg, typ, d, o, yr in interned:
             f.write(bytes(((icao >> 16) & 0xFF, (icao >> 8) & 0xFF, icao & 0xFF)))
             f.write(reg.encode('ascii', 'replace').ljust(REG_LEN, b'\0'))
             f.write(typ.encode('ascii', 'replace').ljust(TYPE_LEN, b'\0'))
-            f.write(b'\0')
+            f.write(struct.pack('<HHH', d, o, yr))
+            f.write(b'\0' * 3)
+        for off in offsets:
+            f.write(struct.pack('<I', off))
+        f.write(blob)
 
-    print(f'\n  {len(rows)} records -> {args.out} ({size/1024:.0f} KB, '
+    named = sum(1 for r in interned if r[3] != NO_STRING)
+    print(f'\n  {len(interned)} records, {named} with a description, '
+          f'{len(strings)} distinct strings ({len(blob)/1024:.0f} KB pooled)')
+    print(f'  -> {args.out} ({size/1024:.0f} KB, '
           f'{100.0*size/SPIFFS_BUDGET:.1f}% of the SPIFFS budget)')
     print('  flash it with: pio run -t uploadfs')
 

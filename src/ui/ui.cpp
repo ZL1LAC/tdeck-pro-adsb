@@ -727,6 +727,39 @@ void drawDetail() {
     textAt(4, y, a->label(), BLACK, 2);
     y += 20;
 
+    // What the aircraft actually is, in words. The feed never carries this --
+    // an aggregator sends a four-letter type designator at best and a local
+    // receiver sends nothing at all -- so it comes from the flashed table.
+    // Looked up here rather than kept on every Aircraft: the detail page shows
+    // one target, where the tracker holds MAX_AIRCRAFT of them.
+    aircraftdb::Details db;
+    const bool known = aircraftdb::details(a->hex, &db);
+
+    if (known && db.desc[0]) {
+        // 40 columns at this size; descriptions run to 47, so wrap once on a
+        // space rather than truncating mid-word.
+        const int kCols = SCREEN_W / CHAR_W - 1;
+        const int len = static_cast<int>(strlen(db.desc));
+        if (len <= kCols) {
+            textAt(4, y, db.desc);
+            y += 10;
+        } else {
+            int split = kCols;
+            while (split > 0 && db.desc[split] != ' ') --split;
+            if (split == 0) split = kCols;  // one very long word
+            char line[48];
+            const size_t n = static_cast<size_t>(split) < sizeof(line)
+                                 ? static_cast<size_t>(split)
+                                 : sizeof(line) - 1;
+            memcpy(line, db.desc, n);
+            line[n] = ' ';
+            textAt(4, y, line);
+            y += 10;
+            textAt(4, y, db.desc + split + (db.desc[split] == ' ' ? 1 : 0));
+            y += 10;
+        }
+    }
+
     g().drawFastHLine(4, y, SCREEN_W - 8, BLACK);
     y += 6;
 
@@ -737,8 +770,22 @@ void drawDetail() {
     };
 
     row("ICAO", a->hex);
-    row("Reg", a->reg[0] ? a->reg : "--");
-    row("Type", a->type[0] ? a->type : "--");
+    // The feed's value wins where it has one; the table fills the gap it
+    // leaves. Neither is second-guessed against the other.
+    row("Reg", a->reg[0] ? a->reg : (known && db.reg[0] ? db.reg : "--"));
+    row("Type", a->type[0] ? a->type : (known && db.type[0] ? db.type : "--"));
+
+    if (known && db.op[0]) {
+        // Operator names run past the panel; the row column starts at 11
+        // characters in, leaving 28 or so.
+        snprintf(buf, sizeof(buf), "%.28s", db.op);
+        row("Operator", buf);
+    }
+    if (known && db.year != 0) {
+        snprintf(buf, sizeof(buf), "%u", static_cast<unsigned>(db.year));
+        row("Built", buf);
+    }
+
     row("Squawk", a->squawk[0] ? a->squawk : "--");
 
     char alt[12];
