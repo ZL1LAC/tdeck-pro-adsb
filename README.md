@@ -450,10 +450,17 @@ Pinning ADSB_PROVIDER_DEFAULT to LOCAL and deleting the aggregator branch of
 adsb::fetch() drops mbedtls and takes flash to 13.7% (898,381 bytes).
 ```
 
-Measured on hardware against an aggregator: ~29 aircraft per poll, 1.3–1.5 s per
-HTTPS fetch and parse, 651 ms partial / 1016 ms full panel refresh. The local
-path has not been timed on hardware yet; on the LAN it is a 5 KB plain-HTTP GET
-with no handshake, so the fetch should be a small fraction of that.
+Measured on hardware, 651 ms partial / 1016 ms full panel refresh either way:
+
+| Feed | Fetch and parse |
+| --- | --- |
+| Aggregator over HTTPS, ~29 aircraft | 1.3–1.5 s |
+| Local receiver over HTTP, ~8 aircraft | **35 ms** |
+
+Nearly all of that difference is the TLS handshake rather than the payload. It
+is the single biggest change in the firmware's power profile: a poll that used
+to hold the CPU boosted for a second and a half now finishes in the gap between
+two panel scans.
 
 ## Not done yet
 
