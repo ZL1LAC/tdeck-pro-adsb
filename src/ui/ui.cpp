@@ -1193,7 +1193,15 @@ void handleTouch(const touch::Event &event) {
 bool tick() {
     // Fold the chrome into the fingerprint so a battery or Wi-Fi change also
     // repaints, but quantise the noisy inputs.
-    uint32_t h = gCtx.tracker ? gCtx.tracker->sceneHash() : 0u;
+    // The radar asks whether anything moved a pixel; the list and detail views
+    // print numbers and are fingerprinted at the resolution they print at.
+    const float hashPxPerNm = (gView == View::Radar) ? pixelsPerNm() : 0.0f;
+    double plotLat = gCtx.ownLat, plotLon = gCtx.ownLon;
+    if (gView == View::Radar) plotCentre(&plotLat, &plotLon);
+
+    uint32_t h = gCtx.tracker
+                     ? gCtx.tracker->sceneHash(plotLat, plotLon, hashPxPerNm)
+                     : 0u;
     auto mix = [&h](uint32_t v) {
         h ^= v + 0x9E3779B9u + (h << 6) + (h >> 2);
     };
@@ -1203,11 +1211,19 @@ bool tick() {
     mix(static_cast<uint32_t>(static_cast<int32_t>(gPanNorthNm * 10.0f)));
     mix(static_cast<uint32_t>(gListTop));
     mix(static_cast<uint32_t>(gMapEnabled));
-    // The basemap moves with our own position even when no aircraft do, so it
-    // has to be in the fingerprint. Quantised to ~0.001 deg (about 100 m) so
-    // GNSS jitter cannot thrash the panel.
-    mix(static_cast<uint32_t>(static_cast<int32_t>(gCtx.ownLat * 1000.0)));
-    mix(static_cast<uint32_t>(static_cast<int32_t>(gCtx.ownLon * 1000.0)));
+    // The basemap and our own crosshair move with our position even when no
+    // aircraft do, so it has to be in the fingerprint -- at the same pixel
+    // resolution as everything else on the radar, which is what finally
+    // silences GNSS jitter rather than merely slowing it down. One nautical
+    // mile is a minute of latitude, so degrees * pxPerNm * 60 is pixels.
+    if (hashPxPerNm > 0.0f) {
+        const double perDeg = static_cast<double>(hashPxPerNm) * 60.0;
+        mix(static_cast<uint32_t>(lround(gCtx.ownLat * perDeg)));
+        mix(static_cast<uint32_t>(lround(gCtx.ownLon * perDeg)));
+    } else {
+        mix(static_cast<uint32_t>(static_cast<int32_t>(gCtx.ownLat * 1000.0)));
+        mix(static_cast<uint32_t>(static_cast<int32_t>(gCtx.ownLon * 1000.0)));
+    }
     mix(gCtx.batteryValid ? gCtx.batteryPercent : 0xFFu);
     mix(static_cast<uint32_t>(gCtx.wifiConnected));
     mix(static_cast<uint32_t>(gCtx.wifiConnected ? wifiBars(gCtx.wifiRssi) : -1));

@@ -455,12 +455,28 @@ Measured on hardware, 651 ms partial / 1016 ms full panel refresh either way:
 | Feed | Fetch and parse |
 | --- | --- |
 | Aggregator over HTTPS, ~29 aircraft | 1.3–1.5 s |
-| Local receiver over HTTP, ~8 aircraft | **35 ms** |
+| Local receiver over HTTP, ~8 aircraft | **34 ms** |
 
 Nearly all of that difference is the TLS handshake rather than the payload. It
 is the single biggest change in the firmware's power profile: a poll that used
 to hold the CPU boosted for a second and a half now finishes in the gap between
 two panel scans.
+
+Which is what lets the local feed be polled at 1 Hz. Measured over a minute on
+hardware, five aircraft in view at the default 40 nm range:
+
+| | Aggregator timings | Local timings |
+| --- | --- | --- |
+| Poll interval, median | 6.02 s | 1.51 s |
+| Partial refreshes | one per ~4 s | one per 2.36 s |
+| Panel duty cycle | ~13% | ~28% |
+
+The panel, not the network, is now the whole constraint. A partial refresh takes
+651 ms, so 1.5 Hz is the ceiling, and every refresh is 651 ms of powered panel
+and one more cycle of wear — a bit over 36,000 a day at the rate above. If the
+board lives on a desk rather than in a hand, raising
+`EPD_MIN_REFRESH_INTERVAL_MS` back towards 4 s halves that and costs only
+latency nobody is watching for.
 
 ## Not done yet
 

@@ -1,5 +1,6 @@
 #include "tracker.h"
 
+#include <math.h>
 #include <string.h>
 
 #include "geo.h"
@@ -111,34 +112,63 @@ int Tracker::indexOfHex(const char *hex) const {
     return findSlot(hex);
 }
 
-uint32_t Tracker::sceneHash() const {
-    // FNV-1a over the fields the renderer actually shows. Positions are
-    // quantised to ~0.001 deg (about 60 m) and altitude to 100 ft so that
-    // GPS jitter alone does not trigger an e-paper refresh.
-    uint32_t h = 2166136261u;
-    auto mix = [&h](uint32_t v) {
-        for (int i = 0; i < 4; ++i) {
-            h ^= (v >> (i * 8)) & 0xFF;
-            h *= 16777619u;
-        }
-    };
-
-    mix(static_cast<uint32_t>(count_));
+uint32_t Tracker::sceneHash(double centreLat, double centreLon,
+                            float pixelsPerNm) const {
+    // FNV-1a per aircraft, summed rather than chained so the result does not
+    // depend on the order the array happens to be sorted into.
+    uint32_t acc = 0;
     for (size_t i = 0; i < count_; ++i) {
         const Aircraft &a = items_[i];
-        for (const char *p = a.hex; *p; ++p) {
-            h ^= static_cast<uint8_t>(*p);
-            h *= 16777619u;
+
+        uint32_t h = 2166136261u;
+        auto mix = [&h](uint32_t v) {
+            for (int b = 0; b < 4; ++b) {
+                h ^= (v >> (b * 8)) & 0xFF;
+                h *= 16777619u;
+            }
+        };
+        auto mixStr = [&h](const char *p) {
+            for (; *p; ++p) {
+                h ^= static_cast<uint8_t>(*p);
+                h *= 16777619u;
+            }
+        };
+
+        mixStr(a.hex);
+        mixStr(a.label());
+
+        if (a.hasPosition) {
+            if (pixelsPerNm > 0.0f) {
+                // Exactly the projection the renderer uses, rounded to the
+                // pixel it would land on.
+                float east = 0.0f, north = 0.0f;
+                geo::projectNm(centreLat, centreLon, a.lat, a.lon, &east, &north);
+                mix(static_cast<uint32_t>(lroundf(east * pixelsPerNm)));
+                mix(static_cast<uint32_t>(lroundf(north * pixelsPerNm)));
+            } else {
+                // The list prints tenths of a mile and whole degrees.
+                mix(static_cast<uint32_t>(
+                    static_cast<int32_t>(a.distanceNm * 10.0f)));
+                mix(static_cast<uint32_t>(
+                    static_cast<int32_t>(a.bearingDeg)));
+            }
         }
-        for (const char *p = a.label(); *p; ++p) {
-            h ^= static_cast<uint8_t>(*p);
-            h *= 16777619u;
-        }
-        mix(static_cast<uint32_t>(static_cast<int32_t>(a.lat * 1000.0)));
-        mix(static_cast<uint32_t>(static_cast<int32_t>(a.lon * 1000.0)));
+
         mix(static_cast<uint32_t>(a.altitudeKnown() ? a.altitudeFt / 100 : -1));
         mix(static_cast<uint32_t>(static_cast<int32_t>(a.trackDeg / 5.0f)));
         mix(static_cast<uint32_t>(static_cast<int32_t>(a.groundSpeedKt / 5.0f)));
+
+        acc += h;
     }
-    return h;
+
+    // Folded in last so that losing one target and gaining another whose
+    // hashes happen to sum the same still counts as a change.
+    uint32_t out = 2166136261u;
+    for (int b = 0; b < 4; ++b) {
+        out ^= (acc >> (b * 8)) & 0xFF;
+        out *= 16777619u;
+        out ^= (static_cast<uint32_t>(count_) >> (b * 8)) & 0xFF;
+        out *= 16777619u;
+    }
+    return out;
 }

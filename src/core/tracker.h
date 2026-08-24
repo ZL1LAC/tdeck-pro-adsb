@@ -35,7 +35,20 @@ class Tracker {
 
     // Cheap fingerprint of everything the UI draws, so we can skip an e-paper
     // refresh when nothing has actually moved.
-    uint32_t sceneHash() const;
+    //
+    // `pixelsPerNm` above zero quantises positions to plot pixels about
+    // (centreLat, centreLon) -- the question the radar actually asks is "has
+    // anything moved a pixel", and at 250 nm one pixel is 2.3 nm. Quantising
+    // in degrees instead, as this used to, meant a target could churn seventy
+    // buckets without moving anywhere the panel could show, which cost a
+    // 651 ms refresh every time. Pass 0 for the list and detail views, where
+    // the readouts are numeric and get the resolution they are printed at.
+    //
+    // Aircraft are combined commutatively, so two targets swapping places in
+    // the distance sort -- which GNSS jitter alone can do when they are
+    // near-equidistant -- is not by itself a reason to repaint.
+    uint32_t sceneHash(double centreLat, double centreLon,
+                       float pixelsPerNm) const;
 
   private:
     Aircraft items_[MAX_AIRCRAFT];

@@ -51,7 +51,12 @@ constexpr uint32_t kAgeOutIntervalMs = 5000;
 // often than EPD_MIN_REFRESH_INTERVAL_MS anyway -- so once a second is
 // already far finer than anything on screen can show. Input and a completed
 // poll both jump the queue, so this is not a latency floor for the user.
-constexpr uint32_t kUiIntervalMs = 1000;
+// Halved from 1000 once the local feed made a poll cost 35 ms: the poll is
+// scheduled off this tick, so a 1 s poll interval sampled once a second
+// aliases into a 2 s one. Reassembling the context is the expensive half and
+// twice a second is still nothing next to the hundred times a second it used
+// to run at.
+constexpr uint32_t kUiIntervalMs = 500;
 
 uint32_t gNextUiMs = 0;
 

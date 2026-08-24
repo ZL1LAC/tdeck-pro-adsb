@@ -61,9 +61,12 @@ enum class AdsbProvider : uint8_t { ADSB_LOL, ADSB_FI, AIRPLANES_LIVE, LOCAL };
 // just above EPD_MIN_REFRESH_INTERVAL_MS, which is as fast as the glass can
 // show a change anyway. The timeout drops with it: a LAN round trip that has
 // not answered in 3 s is not going to.
-// Your own receiver: the limit is the panel, not politeness.
-#define ADSB_LOCAL_POLL_INTERVAL_MS   5000UL
-#define ADSB_LOCAL_MIN_INTERVAL_MS    2000UL
+// Your own receiver: the limit is the panel, not politeness. Measured at 35 ms
+// per fetch on the LAN, so a 1 s poll costs about 3% of one core and readsb
+// only recomputes its own state at 1 Hz anyway -- asking faster than that
+// returns the same numbers twice.
+#define ADSB_LOCAL_POLL_INTERVAL_MS   1000UL
+#define ADSB_LOCAL_MIN_INTERVAL_MS     500UL
 #define ADSB_LOCAL_HTTP_TIMEOUT_MS    3000UL
 
 // A public aggregator: volunteer-run, so be polite.
@@ -133,14 +136,30 @@ static const uint16_t kRangeStepsNm[] = {5, 10, 20, 40, 60, 100, 150, 250};
 static const size_t kRangeStepCount = sizeof(kRangeStepsNm) / sizeof(kRangeStepsNm[0]);
 #define RANGE_DEFAULT_INDEX 3   // 40 nm
 
-// A full (flashing) refresh clears accumulated ghosting. Every Nth partial
-// update is promoted to a full one; also forced on demand with the 'f' key.
-// Floor on how often the panel may be driven. Content can change faster than
-// this (RSSI, poll age, aircraft moving); repainting every time would burn
-// ~1.4 refreshes/second for changes nobody can see. User input bypasses it.
-#define EPD_MIN_REFRESH_INTERVAL_MS 4000UL
+// Floor on how often the panel may be driven, and the backstop against a
+// scene that changes faster than the glass can show it. User input bypasses
+// it, so this is never a floor on responding to a keypress.
+//
+// A partial refresh takes 651 ms, so 1.5 Hz is the physical ceiling and this
+// is what stands between the firmware and running the panel at it. The number
+// matters more than it looks: e-paper wears with every refresh, and holding
+// 1.5 Hz around the clock would be roughly 86,000 refreshes a day.
+//
+// 2 s is chosen to sit just below where the content rate takes over. Now that
+// positions are fingerprinted in plot pixels rather than degrees, a repaint
+// only happens when something actually moves a pixel -- at the default 40 nm
+// range that is 0.36 nm, which a 450 kt aircraft covers in about 3 s, so this
+// floor does not even bind. Zoom in to 5 nm and a pixel is 0.045 nm, crossed
+// in a third of a second, and the floor is what holds the panel to a sane
+// rate. The refresh rate therefore scales itself with the zoom level.
+#define EPD_MIN_REFRESH_INTERVAL_MS 2000UL
 
-#define EPD_FULL_REFRESH_EVERY 20
+// A full (flashing) refresh clears accumulated ghosting. Every Nth partial is
+// promoted to one; also forced on demand with the 'f' key. Raised from 20 with
+// the faster refresh rate -- every 20th was a flash every 30 s once partials
+// could come every 2 s, which reads as a fault rather than as maintenance.
+// Tune by eye: too high and ghosting builds, too low and the flashing annoys.
+#define EPD_FULL_REFRESH_EVERY 60
 #define EPD_FULL_REFRESH_MAX_AGE_MS 600000UL   // 10 minutes
 
 // Keyboard backlight on at boot.
