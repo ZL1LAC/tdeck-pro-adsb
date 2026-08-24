@@ -1,0 +1,4 @@
+# Keep LF in the repository regardless of what the checkout does locally, so a
+# Windows and a Linux clone do not show every line as changed.
+* text=auto eol=lf
+*.bin binary

@@ -1,0 +1,17 @@
+.pio/
+.vscode/
+.clangd/
+compile_commands.json
+*.bin
+*.elf
+
+# Wi-Fi password and home position. Template: include/secrets.example.h
+include/secrets.h
+
+# Re-downloaded on demand by tools/build_map.py (26 MB of Natural Earth and
+# OurAirports source data).
+tools/.mapcache/
+
+# Third-party airspace you supply yourself -- redistribution terms vary, and
+# README.md says where to fetch it. Drop this line if yours is freely shareable.
+mapsrc/
