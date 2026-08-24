@@ -1165,13 +1165,23 @@ void handleKey(char key) {
 
 // A press and release in roughly the same place.
 void handleTap(int16_t x, int16_t y) {
+    // On the detail and diagnostics pages both strips of chrome mean "back".
+    // Swapping radar for list is meaningless from a page that is neither, and
+    // the footer legend on both of them literally reads "U:back" -- so tapping
+    // it has to do that. It used to ask for the detail view, which from the
+    // detail view is a no-op, leaving the one strip of screen that says "back"
+    // as the one strip that ignored you.
+    const bool subPage = (gView == View::Detail || gView == View::Status);
+
     if (y < STATUS_H) {
-        setView(gView == View::Radar ? View::List : View::Radar);
+        if (subPage) goBack();
+        else setView(gView == View::Radar ? View::List : View::Radar);
         return;
     }
 
     if (y >= FOOTER_Y) {
-        if (selected()) setView(View::Detail);
+        if (subPage) goBack();
+        else if (selected()) setView(View::Detail);
         return;
     }
 

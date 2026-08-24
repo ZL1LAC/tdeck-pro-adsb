@@ -123,6 +123,9 @@ Touch:
   the plot does not track your finger — it redraws once, on release.
 - **Tap** an aircraft to select it, a list row to select it, a selected row (or
   the footer) to open its detail page, or the status bar to swap views.
+- **On the detail and diagnostics pages, a tap anywhere goes back** -- body,
+  status bar or footer. Those pages have nothing to select and no views to swap
+  between, and their footers say `U:back`.
 - **`+` / `−` buttons** in the bottom corners zoom. Once panned, a crosshair
   button appears top-left to recentre.
 
