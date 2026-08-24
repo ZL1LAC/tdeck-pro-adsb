@@ -96,6 +96,15 @@ enum class AdsbProvider : uint8_t { ADSB_LOL, ADSB_FI, AIRPLANES_LIVE, LOCAL };
 #define MAP_ENABLED_BY_DEFAULT true
 #define MAP_FILE "/map.bin"
 
+// ICAO address -> registration and type, also in SPIFFS, also optional:
+//
+//     python tools/build_db.py           # writes data/aircraftdb.bin
+//     pio run -t uploadfs
+//
+// Only needed because a local receiver's aircraft.json carries neither field.
+// Absent, those columns stay empty exactly as they did before.
+#define AIRCRAFT_DB_FILE "/aircraftdb.bin"
+
 // Airport idents are only drawn at or below this range, where there is room
 // for them without burying the traffic.
 #define MAP_LABEL_RANGE_NM 40

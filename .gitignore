@@ -15,3 +15,6 @@ tools/.mapcache/
 # Third-party airspace you supply yourself -- redistribution terms vary, and
 # README.md says where to fetch it. Drop this line if yours is freely shareable.
 mapsrc/
+
+# Re-downloaded on demand by tools/build_db.py (8 MB of tar1090-db).
+tools/.dbcache/

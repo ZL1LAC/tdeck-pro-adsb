@@ -12,7 +12,9 @@
 
 #include "board_pins.h"
 #include "config.h"
+#include "core/aircraftdb.h"
 #include "core/geo.h"
+#include "core/settings.h"
 #include "core/tracker.h"
 #include "hw/clock.h"
 #include "hw/gnss.h"
@@ -168,7 +170,13 @@ void setup() {
     Serial.println();
     Serial.println("T-Deck Pro ADS-B tracker starting");
 
+    // Before power::begin(), which sets the keyboard backlight, and before
+    // ui::begin() and the first poll, both of which read saved choices.
+    settings::begin();
+    adsb::setProvider(static_cast<AdsbProvider>(settings::get().provider));
+
     power::begin();
+    power::setKeypadBacklight(settings::get().keypadBacklight);
     display::begin();
     display::render(0, drawSplash);
 
@@ -181,6 +189,7 @@ void setup() {
     net::begin();
     wallclock::begin();
     basemap::begin();
+    aircraftdb::begin();
     ui::begin();
 
     refreshBattery();
@@ -227,6 +236,7 @@ void loop() {
 
     wallclock::poll();
     refreshBattery();
+    settings::poll();
 
     double lat = 0.0, lon = 0.0;
     bool fromGnss = false;

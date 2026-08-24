@@ -8,6 +8,7 @@
 #include <string.h>
 
 #include "config.h"
+#include "core/aircraftdb.h"
 #include "core/geo.h"
 
 namespace adsb {
@@ -360,6 +361,24 @@ FetchStats runFetch(WiFiClient &client, const char *url, Tracker &tracker,
             geo::distanceNm(lat, lon, parsed.lat, parsed.lon) > filterRadiusNm) {
             ++stats.filtered;
             continue;
+        }
+
+        // A local aircraft.json carries no "r" or "t" at all, and even an
+        // aggregator leaves them out for aircraft it has not identified. The
+        // flashed table fills what it can; anything it misses stays empty and
+        // may still arrive from a later poll, so this never overwrites.
+        if (!parsed.reg[0] || !parsed.type[0]) {
+            char reg[sizeof(parsed.reg)] = {0};
+            char type[sizeof(parsed.type)] = {0};
+            if (aircraftdb::lookup(parsed.hex, reg, sizeof(reg), type,
+                                   sizeof(type))) {
+                if (!parsed.reg[0]) {
+                    strncpy(parsed.reg, reg, sizeof(parsed.reg) - 1);
+                }
+                if (!parsed.type[0]) {
+                    strncpy(parsed.type, type, sizeof(parsed.type) - 1);
+                }
+            }
         }
 
         if (!tracker.upsert(parsed, now)) {

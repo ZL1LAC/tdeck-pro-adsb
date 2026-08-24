@@ -10,6 +10,8 @@
 #include "board_pins.h"
 #include "config.h"
 #include "core/geo.h"
+#include "core/aircraftdb.h"
+#include "core/settings.h"
 #include "display.h"
 #include "hw/clock.h"
 #include "hw/keypad.h"
@@ -81,7 +83,7 @@ View gView = View::Radar;
 View gPreviousView = View::Radar;
 
 char gSelectedHex[8] = {0};
-size_t gRangeIndex = RANGE_DEFAULT_INDEX;
+size_t gRangeIndex = RANGE_DEFAULT_INDEX;  // overwritten by begin() from NVS
 
 // Plot centre as an offset from our own position, in nautical miles.
 float gPanEastNm = 0.0f;
@@ -94,6 +96,19 @@ int gListTop = 0;
 bool gRefreshRequested = false;
 bool gCentreOnGnss = GNSS_CENTRE_BY_DEFAULT;
 bool gMapEnabled = MAP_ENABLED_BY_DEFAULT;
+
+// Mirrors the handful of UI choices worth surviving a reboot into the
+// persisted set. The write itself is deferred and coalesced by
+// settings::poll(), so calling this on every keypress is cheap.
+void persist() {
+    Settings &s = settings::get();
+    s.rangeIndex = static_cast<uint8_t>(gRangeIndex);
+    s.mapEnabled = gMapEnabled;
+    s.centreOnGnss = gCentreOnGnss;
+    s.keypadBacklight = power::keypadBacklight();
+    s.provider = static_cast<uint8_t>(adsb::provider());
+    settings::markDirty();
+}
 
 // ------------------------------------------------------------- helpers -----
 Adafruit_GFX &g() { return display::gfx(); }
@@ -274,12 +289,14 @@ void panByNm(float eastNm, float northNm) {
 void zoomIn() {
     if (gRangeIndex == 0) return;
     --gRangeIndex;
+    persist();
     display::invalidate();
 }
 
 void zoomOut() {
     if (gRangeIndex + 1 >= kRangeStepCount) return;
     ++gRangeIndex;
+    persist();
     display::invalidate();
 }
 
@@ -897,6 +914,9 @@ void drawStatus() {
              gCtx.touchPresent ? "touch" : "NO touch");
     row("Input", buf);
 
+    row("AC db", aircraftdb::status());
+    row("Settings", settings::status());
+
     snprintf(buf, sizeof(buf), "%u k / %u k",
              static_cast<unsigned>(ESP.getFreeHeap() / 1024),
              static_cast<unsigned>(ESP.getFreePsram() / 1024));
@@ -935,6 +955,13 @@ void goBack() {
 }  // namespace
 
 void begin() {
+    // settings::begin() has already run, so this is the saved set or the
+    // config.h defaults -- the UI cannot tell which, and does not need to.
+    const Settings &s = settings::get();
+    gRangeIndex = s.rangeIndex < kRangeStepCount ? s.rangeIndex : RANGE_DEFAULT_INDEX;
+    gMapEnabled = s.mapEnabled;
+    gCentreOnGnss = s.centreOnGnss;
+
     gView = View::Radar;
     gPreviousView = View::Radar;
     display::invalidate(true);
@@ -1037,15 +1064,18 @@ void handleKey(char key) {
             // one would be meaningless.
             gPanEastNm = 0.0f;
             gPanNorthNm = 0.0f;
+            persist();
             display::invalidate();
             break;
 
         case 'l':
             power::setKeypadBacklight(!power::keypadBacklight());
+            persist();
             break;
 
         case 'm':
             gMapEnabled = !gMapEnabled;
+            persist();
             display::invalidate();
             break;
 
@@ -1056,6 +1086,7 @@ void handleKey(char key) {
         // them while positions go back to being a fraction of a second old.
         case 'p':
             adsb::toggleProvider();
+            persist();
             gRefreshRequested = true;
             display::invalidate();
             break;

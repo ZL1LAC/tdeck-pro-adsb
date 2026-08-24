@@ -192,9 +192,10 @@ What it costs:
 - **Coverage stops at your antenna's horizon.** The aggregators pool every
   receiver in the country; you see what you can hear.
 - **No registration or type designator.** `aircraft.json` carries neither unless
-  readsb is run with a `--db-file`, so those columns sit empty. Note the trap:
-  there *is* a `type` field, but it holds `adsb_icao` — the message source, not
-  the airframe.
+  readsb is run with a `--db-file`. Rather than spend ~50 MB of the Pi's RAM on
+  that, the device carries its own lookup table — see [Aircraft
+  database](#aircraft-database). Note the trap in the JSON: there *is* a `type`
+  field, but it holds `adsb_icao` — the message source, not the airframe.
 - **It only exists on your own network.** Carry the board out of range and the
   feed goes quiet until you switch `ADSB_PROVIDER` back.
 
@@ -307,6 +308,58 @@ what a build will look like before flashing it. Use it to judge clutter.
 Only the Python standard library is used, so both scripts run wherever the
 toolchain does.
 
+## Aircraft database
+
+`aircraft.json` gives you `hex` but not the registration or the type
+designator. readsb will serve both if started with a `--db-file`, but holding
+that database costs a Raspberry Pi around 50 MB of RAM. The mapping is fixed, so
+carrying it on the device instead costs the Pi nothing and needs no network:
+
+```
+python tools/build_db.py --blocks C8,7C
+pio run -t uploadfs
+```
+
+The full database is 615k records and 30 MB uncompressed, which neither fits a
+3.4 MB SPIFFS partition nor needs to — an aircraft has to be within radio range
+to appear on the plot, so only the ICAO address blocks you can actually hear are
+worth carrying.
+
+| Blocks | Records | On SPIFFS |
+| --- | --- | --- |
+| `C8` — New Zealand and Fiji | 4,898 | 77 KB |
+| `C8,7C` — adding Australia | 22,807 | 356 KB |
+| `all` | 615,897 | 9 MB — will not fit |
+
+Pick by what actually turns up: a sample of one Auckland feed had five NZ and
+two Australian aircraft airborne at once, so `C8,7C` is the sensible default
+there. Missing data is not an error — an aircraft the table does not know keeps
+empty fields, exactly as before, and a later poll through an aggregator can
+still fill them in.
+
+The source is [tar1090-db](https://github.com/wiedehopf/tar1090-db) (ODbL),
+fetched on demand and cached in `tools/.dbcache`.
+[`tools/verify_db.py`](tools/verify_db.py) reads the blob back with an
+independent parser — the same second-implementation trick `verify_map.py` uses —
+and checks that the keys really are strictly ascending, since the firmware
+binary-searches them:
+
+```
+python tools/verify_db.py                      # structure + a sample
+python tools/verify_db.py --hex c82347 7c561d  # resolve specific aircraft
+```
+
+## Settings that survive a reboot
+
+Range, basemap on/off, GNSS centring, keyboard backlight and the chosen feed are
+kept in NVS. Everything else — the pan offset, the selection, the view — is
+deliberately not: restoring them would bring back a picture of traffic that flew
+away hours ago.
+
+Writes are deferred five seconds and skipped when the bytes have not actually
+changed, so holding a zoom key through a dozen range steps costs one write
+rather than twelve, and toggling something back the way it was costs none.
+
 ## How it is put together
 
 ```
@@ -314,6 +367,8 @@ src/
   main.cpp              orchestration: poll, gather context, render
   core/
     aircraft.h          one target, flat POD
+    aircraftdb.{h,cpp}  ICAO -> registration/type, binary search in PSRAM
+    settings.{h,cpp}    the handful of choices worth keeping in NVS
     tracker.{h,cpp}     merge snapshots, age out, sort by range, scene hash
     geo.{h,cpp}         haversine, bearing, flat-earth projection, units
   hw/
@@ -386,9 +441,10 @@ UART, I2C and SPI peripherals need no re-tuning across the change.
 ## Current footprint
 
 ```
-RAM:   21.3% (69,760 / 327,680 bytes)
-Flash: 15.6% (1,020,949 / 6,553,600 bytes)
-SPIFFS: 73 KB of 3.4 MB used by the basemap (coast + airports + airspace)
+RAM:   21.3% (69,928 / 327,680 bytes)
+Flash: 15.7% (1,026,645 / 6,553,600 bytes)
+SPIFFS: 73 KB basemap + 356 KB aircraft database, of 3.4 MB
+PSRAM:  356 KB, holding the aircraft database for the life of the run
 
 Pinning ADSB_PROVIDER_DEFAULT to LOCAL and deleting the aggregator branch of
 adsb::fetch() drops mbedtls and takes flash to 13.7% (898,381 bytes).
