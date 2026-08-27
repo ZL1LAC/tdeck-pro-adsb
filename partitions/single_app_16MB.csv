@@ -1,0 +1,23 @@
+# T-Deck Pro ADS-B tracker: one app slot, no OTA, everything else to SPIFFS.
+#
+# The stock default_16MB.csv is a dual-OTA layout -- two 6.4 MB app slots, for a
+# firmware that is 1 MB and an update mechanism nothing here uses -- which left
+# 3.4 MB for data. Dropping the second slot and trimming the first to a still
+# extravagant 4 MB hands 8.5 MB of that back to the filesystem.
+#
+# nvs and otadata keep their stock offsets, so settings saved under the old
+# layout survive the change. Everything after them moves, which means the
+# filesystem has to be reflashed once after switching:
+#
+#     pio run -t uploadfs
+#
+# The ceiling on the aircraft database is not this partition, incidentally.
+# aircraftdb::begin() loads the whole file into PSRAM, and there are 8 MB of
+# that, shared with the basemap, the silhouettes and the JSON arena.
+#
+# Name,     Type, SubType,  Offset,   Size,     Flags
+nvs,        data, nvs,      0x9000,   0x5000,
+otadata,    data, ota,      0xe000,   0x2000,
+app0,       app,  ota_0,    0x10000,  0x400000,
+spiffs,     data, spiffs,   0x410000, 0xBE0000,
+coredump,   data, coredump, 0xFF0000, 0x10000,
