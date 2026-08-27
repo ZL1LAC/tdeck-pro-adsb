@@ -8,6 +8,7 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <esp_heap_caps.h>
 #include <math.h>
 
 #include "board_pins.h"
@@ -39,6 +40,7 @@ double gLastQueryLat = 0.0;
 double gLastQueryLon = 0.0;
 bool gHaveQueried = false;
 uint32_t gNextBatteryMs = 0;
+uint32_t gNextHeapLogMs = 0;
 bool gBatteryValid = false;
 uint8_t gBatteryPercent = 0;
 uint16_t gBatteryMilliVolts = 0;
@@ -138,34 +140,87 @@ uint16_t queryRadiusNm(float panDistNm) {
     return static_cast<uint16_t>(r > 250 ? 250 : r);
 }
 
-void pollFeed(double lat, double lon, uint16_t radiusNm) {
-    // Recorded up front so a rate-limited call still counts as "we have asked
-    // about this area", instead of retriggering on every loop.
+// Hands the query to the fetch task and returns immediately. Nothing about
+// the outcome is known here; collectPoll() picks it up on a later pass, which
+// is the entire point of the arrangement -- the socket, the TLS handshake and
+// the JSON parse no longer sit between a keypress and the panel noticing it.
+void startPoll(double lat, double lon, uint16_t radiusNm) {
+    // Recorded up front so a refused call still counts as "we have asked about
+    // this area", instead of retriggering on every loop.
     gLastRadiusNm = radiusNm;
     gLastQueryLat = lat;
     gLastQueryLon = lon;
     gHaveQueried = true;
 
-    // The handshake and the JSON parse are the only genuinely CPU-bound work
-    // in the poll, and they are over in a second or two.
-    power::Boost boost;
-
-    const adsb::FetchStats stats = adsb::fetch(gTracker, lat, lon, radiusNm);
-    if (stats.result == adsb::Result::RateLimited) {
+    if (!adsb::request(lat, lon, radiusNm)) {
+        // Throttled, or the link went away between the check and here.
         gNextPollMs = millis() + adsb::minIntervalMs();
         return;
     }
+
+    // Scheduled from the request rather than from the result, now that the
+    // two are no longer the same instant. ADSB_*_POLL_INTERVAL_MS means how
+    // often we hit the feed; measuring it from the answer instead makes it
+    // that plus however long the answer took, plus however much of a 651 ms
+    // repaint it landed in the middle of. On hardware that stretched a 1 s
+    // local poll to 2.3 s -- the panel setting the feed's cadence, which is
+    // exactly backwards.
+    gNextPollMs = millis() + adsb::pollIntervalMs();
+
+    // Held until the result is collected. That window is exactly the fetch,
+    // and the fetch is the only genuinely CPU-bound work outside a repaint.
+    power::acquireBoost();
+}
+
+// True when a fetch landed on this pass, which is what triggers the recompute
+// below. Scheduling is startPoll()'s job, apart from the backoff.
+bool collectPoll() {
+    adsb::FetchStats stats;
+    if (!adsb::collect(gTracker, &stats)) return false;
+    power::releaseBoost();
+
     // Back off a little on failure so a dead feed does not hammer the link.
-    gNextPollMs = millis() + (stats.result == adsb::Result::Ok
-                                  ? adsb::pollIntervalMs()
-                                  : adsb::pollIntervalMs() * 2);
+    if (stats.result != adsb::Result::Ok) {
+        gNextPollMs = millis() + adsb::pollIntervalMs() * 2;
+    }
+    return true;
 }
 
 void refreshBattery() {
     const uint32_t now = millis();
-    if (now < gNextBatteryMs) return;
+    // Wrap-safe, like every other deadline here. Compared directly it was the
+    // one that was not: at the 49.7-day millis() rollover `now` restarts near
+    // zero while this deadline is still near the top of the range, so the
+    // gauge would never be read again until the next reboot.
+    if (static_cast<int32_t>(now - gNextBatteryMs) < 0) return;
     gNextBatteryMs = now + kBatteryIntervalMs;
     gBatteryValid = power::readBattery(&gBatteryPercent, &gBatteryMilliVolts);
+}
+
+// Free bytes and the largest contiguous block, for both heaps. The two figures
+// diverging is fragmentation, which is the failure a device that runs for
+// weeks actually suffers -- and the feed hands the PSRAM allocator a
+// variable-size JSON arena to allocate and free about once a second, so it is
+// the pattern most likely to cause it here.
+void logHeap() {
+    if (DIAG_HEAP_LOG_INTERVAL_MS == 0) return;
+    const uint32_t now = millis();
+    if (static_cast<int32_t>(now - gNextHeapLogMs) < 0) return;
+    gNextHeapLogMs = now + DIAG_HEAP_LOG_INTERVAL_MS;
+
+    log_i("heap: int %uk free / %uk min / %uk block | psram %uk free / %uk min "
+          "/ %uk block | feed task %u B",
+          static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
+          static_cast<unsigned>(
+              heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL) / 1024),
+          static_cast<unsigned>(
+              heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) / 1024),
+          static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024),
+          static_cast<unsigned>(
+              heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM) / 1024),
+          static_cast<unsigned>(
+              heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) / 1024),
+          static_cast<unsigned>(adsb::taskHeadroomBytes()));
 }
 
 }  // namespace
@@ -193,6 +248,7 @@ void setup() {
 
     gnss::begin();
     net::begin();
+    adsb::begin();
     wallclock::begin();
     basemap::begin();
     aircraftdb::begin();
@@ -202,15 +258,19 @@ void setup() {
     refreshBattery();
     gNextPollMs = millis();  // poll as soon as the link comes up
 
-    // Everything above ran at the 240 MHz boot frequency. From here on the
-    // clock is raised only around a feed poll and a repaint.
-    power::setBoost(false);
+    // Everything above ran at the 240 MHz boot frequency: release the claim
+    // boot holds, and from here on the clock is raised only around a feed
+    // fetch and a repaint.
+    power::releaseBoost();
 }
 
 void loop() {
     // -- fast path. Everything here has to keep up with the hardware: the
-    // GNSS UART ring is 256 bytes, which is 67 ms of NMEA at 38400 baud, and
-    // a keypress the user cannot feel land is a keypress they press twice.
+    // GNSS UART ring is two kilobytes, which is half a second of NMEA at 38400
+    // baud, and a keypress the user cannot feel land is a keypress they press
+    // twice. Nothing below blocks for longer than a panel refresh any more --
+    // the feed fetch, which used to hold this loop for a second and a half at
+    // a time, now runs on a task of its own and hands back a result.
     net::poll();
     gnss::poll();
 
@@ -233,7 +293,10 @@ void loop() {
     // none of it could change fast enough to matter. Input, and the poll it
     // may have triggered, still run it immediately.
     const uint32_t now = millis();
-    if (!input && static_cast<int32_t>(now - gNextUiMs) < 0) {
+    // A landed fetch jumps the queue the same way input does: it is the one
+    // thing that changes the picture, and letting it wait out the rest of a
+    // tick would hand back the latency the task just saved.
+    if (!input && !adsb::ready() && static_cast<int32_t>(now - gNextUiMs) < 0) {
         delay(10);
         return;
     }
@@ -244,6 +307,7 @@ void loop() {
     wallclock::poll();
     refreshBattery();
     settings::poll();
+    logHeap();
 
     // The only consumers of a GNSS position are the plot centre and, until it
     // is set, the clock. When neither wants one the module is powered down
@@ -271,18 +335,21 @@ void loop() {
     const bool connected = net::connected();
     refreshNetworkText(connected);
 
-    bool polled = false;
-    if (connected && (manual || rangeGrew || moved ||
-                      static_cast<int32_t>(now - gNextPollMs) >= 0)) {
-        pollFeed(viewLat, viewLon, radius);
-        polled = true;
+    // Collected before the next one is started, so a feed that answers inside
+    // one tick can start its successor on the same pass rather than the next.
+    const bool fetched = collectPoll();
+
+    if (connected && !adsb::busy() &&
+        (manual || rangeGrew || moved ||
+         static_cast<int32_t>(now - gNextPollMs) >= 0)) {
+        startPoll(viewLat, viewLon, radius);
     }
 
     // Ranges and bearings are always measured from our own position, never the
-    // view centre. Recomputed after every poll, and periodically regardless so
-    // stale targets retire even when the link is down -- otherwise a dropped
-    // Wi-Fi connection leaves a frozen plot that still looks live.
-    if (polled || static_cast<int32_t>(now - gNextAgeOutMs) >= 0) {
+    // view centre. Recomputed after every fetch, and periodically regardless
+    // so stale targets retire even when the link is down -- otherwise a
+    // dropped Wi-Fi connection leaves a frozen plot that still looks live.
+    if (fetched || static_cast<int32_t>(now - gNextAgeOutMs) >= 0) {
         gNextAgeOutMs = now + kAgeOutIntervalMs;
         gTracker.finishUpdate(lat, lon, millis());
     }

@@ -28,19 +28,25 @@ bool keypadBacklight();
 //
 // 80 MHz is the floor that keeps the PLL-derived APB clock at 80 MHz, so the
 // UART, I2C and SPI peripherals need no re-tuning across the change.
-void setBoost(bool on);
+//
+// Counted rather than set, because there are now two things that want it and
+// they overlap: the fetch runs on its own task and a repaint runs on the loop
+// task, and whichever finishes first must not drop the clock out from under
+// the other. The frequency rises on the first claim and falls on the last
+// release. Boot counts as a claim -- setup() runs at 240 MHz -- so main()
+// releases one at the end of it.
+void acquireBoost();
+void releaseBoost();
 bool boosted();
 
-// Scoped form: boosts on construction, drops back on the way out.
+// Scoped form, for a claim that starts and ends in one place. A claim handed
+// between loop passes -- the fetch -- has to use the calls above instead.
 class Boost {
    public:
-    Boost() : was_(boosted()) { setBoost(true); }
-    ~Boost() { setBoost(was_); }
+    Boost() { acquireBoost(); }
+    ~Boost() { releaseBoost(); }
     Boost(const Boost &) = delete;
     Boost &operator=(const Boost &) = delete;
-
-   private:
-    bool was_;
 };
 
 }  // namespace power

@@ -12,6 +12,10 @@ namespace {
 bool gKeypadBacklight = false;
 bool gBoosted = true;  // setup() runs at the boot frequency
 
+// One claim held from boot, released at the end of setup().
+int gBoostClaims = 1;
+portMUX_TYPE gBoostMux = portMUX_INITIALIZER_UNLOCKED;
+
 constexpr uint32_t kIdleCpuMhz = 80;
 constexpr uint32_t kBoostCpuMhz = 240;
 
@@ -109,12 +113,34 @@ void setKeypadBacklight(bool on) {
 
 bool keypadBacklight() { return gKeypadBacklight; }
 
-void setBoost(bool on) {
+namespace {
+
+void applyBoost(bool on) {
     if (on == gBoosted) return;
     // setCpuFrequencyMhz() is a no-op when the frequency already matches and
     // notifies the peripheral drivers itself, so this is safe to call often.
     if (!setCpuFrequencyMhz(on ? kBoostCpuMhz : kIdleCpuMhz)) return;
     gBoosted = on;
+}
+
+}  // namespace
+
+void acquireBoost() {
+    bool first = false;
+    portENTER_CRITICAL(&gBoostMux);
+    first = (gBoostClaims++ == 0);
+    portEXIT_CRITICAL(&gBoostMux);
+    // Outside the critical section: setCpuFrequencyMhz() walks the peripheral
+    // drivers and is far too heavy to hold a spinlock across both cores for.
+    if (first) applyBoost(true);
+}
+
+void releaseBoost() {
+    bool last = false;
+    portENTER_CRITICAL(&gBoostMux);
+    if (gBoostClaims > 0) last = (--gBoostClaims == 0);
+    portEXIT_CRITICAL(&gBoostMux);
+    if (last) applyBoost(false);
 }
 
 bool boosted() { return gBoosted; }

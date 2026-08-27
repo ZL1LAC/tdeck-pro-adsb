@@ -1,10 +1,15 @@
 #include "adsb_source.h"
 
 #include <ArduinoJson.h>
+#include <Arduino.h>
 #include <HTTPClient.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
+#include <atomic>
 #include <esp_heap_caps.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
+#include <freertos/task.h>
 #include <string.h>
 
 #include "config.h"
@@ -23,9 +28,9 @@ FetchStats gLastStats;
 
 AdsbProvider gProvider = ADSB_PROVIDER_DEFAULT;
 
-uint32_t httpTimeoutMs() {
-    return (gProvider == AdsbProvider::LOCAL) ? ADSB_LOCAL_HTTP_TIMEOUT_MS
-                                              : ADSB_REMOTE_HTTP_TIMEOUT_MS;
+uint32_t httpTimeoutMs(AdsbProvider p) {
+    return (p == AdsbProvider::LOCAL) ? ADSB_LOCAL_HTTP_TIMEOUT_MS
+                                      : ADSB_REMOTE_HTTP_TIMEOUT_MS;
 }
 
 // ArduinoJson allocates the parse tree in one arena. A busy 250 nm query can
@@ -43,17 +48,19 @@ struct PsramAllocator : ArduinoJson::Allocator {
     }
 };
 
-const char *arrayKey() {
+// Taken as a parameter rather than read from gProvider: the fetch runs on
+// another task, and the 'p' key can land in the middle of one. Whichever feed
+// the request was aimed at is the one whose response shape it has to parse.
+const char *arrayKey(AdsbProvider p) {
     // readsb and adsb.fi both name it "aircraft"; adsb.lol and airplanes.live
     // shorten it to "ac".
-    return (gProvider == AdsbProvider::ADSB_FI ||
-            gProvider == AdsbProvider::LOCAL)
-               ? "aircraft"
-               : "ac";
+    return (p == AdsbProvider::ADSB_FI || p == AdsbProvider::LOCAL) ? "aircraft"
+                                                                   : "ac";
 }
 
-void buildUrl(char *out, size_t len, double lat, double lon, int radiusNm) {
-    switch (gProvider) {
+void buildUrl(char *out, size_t len, AdsbProvider p, double lat, double lon,
+              int radiusNm) {
+    switch (p) {
         case AdsbProvider::LOCAL:
             // A receiver's aircraft.json is a fixed path holding everything it
             // currently hears -- there is nothing to parameterise, and the
@@ -83,8 +90,8 @@ void buildUrl(char *out, size_t len, double lat, double lon, int radiusNm) {
 // Only these fields survive parsing; everything else in the response is
 // discarded as it streams past, which keeps the arena an order of magnitude
 // smaller than the raw JSON.
-void buildFilter(JsonDocument &filter) {
-    JsonObject item = filter[arrayKey()].add<JsonObject>();
+void buildFilter(JsonDocument &filter, AdsbProvider p) {
+    JsonObject item = filter[arrayKey(p)].add<JsonObject>();
     item["hex"] = true;
     item["flight"] = true;
     item["r"] = true;
@@ -240,6 +247,17 @@ bool decodeAircraft(JsonObjectConst src, Aircraft *out) {
     const char *emergency = src["emergency"].as<const char *>();
     out->emergency = emergency && emergency[0] && strcmp(emergency, "none") != 0;
 
+    // The emergency field is only there when the aircraft actually broadcasts
+    // an emergency/priority status, which plenty never do -- but the Mode-A
+    // code is in almost every message. 7500 hijack, 7600 radio failure, 7700
+    // general emergency: the three that mean the same thing everywhere in the
+    // world, and the reason to look up from the screen.
+    if (!out->emergency && out->squawk[0]) {
+        out->emergency = strcmp(out->squawk, "7500") == 0 ||
+                         strcmp(out->squawk, "7600") == 0 ||
+                         strcmp(out->squawk, "7700") == 0;
+    }
+
     return true;
 }
 
@@ -285,14 +303,14 @@ namespace {
 // Everything from the GET to the merge, once a transport has been chosen.
 // Split out so the plain-HTTP and TLS paths can share it without either one
 // paying to construct the other's client.
-FetchStats runFetch(WiFiClient &client, const char *url, Tracker &tracker,
-                    double lat, double lon, uint16_t radiusNm,
+FetchStats runFetch(WiFiClient &client, const char *url, AdsbProvider p,
+                    Tracker &tracker, double lat, double lon, uint16_t radiusNm,
                     uint32_t started) {
     FetchStats stats;
 
     HTTPClient http;
-    http.setTimeout(httpTimeoutMs());
-    http.setConnectTimeout(httpTimeoutMs());
+    http.setTimeout(httpTimeoutMs(p));
+    http.setConnectTimeout(httpTimeoutMs(p));
     // HTTP/1.0 asks the server not to chunk the body, which lets ArduinoJson
     // read straight off the socket.
     http.useHTTP10(true);
@@ -319,14 +337,14 @@ FetchStats runFetch(WiFiClient &client, const char *url, Tracker &tracker,
 
     PsramAllocator allocator;
     JsonDocument filter(&allocator);
-    buildFilter(filter);
+    buildFilter(filter, p);
 
     JsonDocument doc(&allocator);
-    // Static rather than stack: the loop task shares its stack with the TLS
-    // session, which is already the tightest thing in the firmware.
+    // Static rather than stack: this runs on the fetch task, whose stack is
+    // already carrying an mbedtls session.
     static uint8_t rxBuffer[2048];
     BufferedStream buffered(http.getStream(), rxBuffer, sizeof(rxBuffer),
-                            httpTimeoutMs());
+                            httpTimeoutMs(p));
     const DeserializationError err = deserializeJson(
         doc, buffered, DeserializationOption::Filter(filter));
     http.end();
@@ -337,7 +355,7 @@ FetchStats runFetch(WiFiClient &client, const char *url, Tracker &tracker,
         return stats;
     }
 
-    JsonArrayConst list = doc[arrayKey()].as<JsonArrayConst>();
+    JsonArrayConst list = doc[arrayKey(p)].as<JsonArrayConst>();
     if (list.isNull()) {
         log_w("adsb: response carried no aircraft array");
         stats.result = Result::ParseError;
@@ -357,7 +375,7 @@ FetchStats runFetch(WiFiClient &client, const char *url, Tracker &tracker,
         // MAX_AIRCRAFT slot a nearby one needs. Targets with no position are
         // kept regardless -- they cannot be plotted, but they still belong in
         // the list, and that is what the aggregators return too.
-        if (isLocal() && parsed.hasPosition &&
+        if (p == AdsbProvider::LOCAL && parsed.hasPosition &&
             geo::distanceNm(lat, lon, parsed.lat, parsed.lon) > filterRadiusNm) {
             ++stats.filtered;
             continue;
@@ -382,11 +400,19 @@ FetchStats runFetch(WiFiClient &client, const char *url, Tracker &tracker,
         }
 
         if (!tracker.upsert(parsed, now)) {
-            log_w("adsb: tracker full at %d aircraft; dropping the rest",
-                  MAX_AIRCRAFT);
-            break;
+            // Full, and this one is no nearer than anything already held. Skip
+            // it and keep going: the rest of the snapshot is mostly aircraft
+            // we are already tracking, and abandoning it here would stop
+            // refreshing them until they aged out -- a plot that freezes in
+            // patches while the feed is perfectly healthy.
+            ++stats.dropped;
+            continue;
         }
         ++stats.stored;
+    }
+    if (stats.dropped > 0) {
+        log_w("adsb: store full at %d aircraft; %u further targets refused",
+              MAX_AIRCRAFT, static_cast<unsigned>(stats.dropped));
     }
 
     stats.result = Result::Ok;
@@ -394,28 +420,12 @@ FetchStats runFetch(WiFiClient &client, const char *url, Tracker &tracker,
     return stats;
 }
 
-}  // namespace
-
-FetchStats fetch(Tracker &tracker, double lat, double lon, uint16_t radiusNm) {
-    FetchStats stats;
+FetchStats fetchBlocking(AdsbProvider p, double lat, double lon,
+                         uint16_t radiusNm, Tracker &into) {
     const uint32_t started = millis();
 
-    if (WiFi.status() != WL_CONNECTED) {
-        stats.result = Result::NotConnected;
-        gLastStats = stats;
-        return stats;
-    }
-    if (gLastAttemptMs != 0 && started - gLastAttemptMs < minIntervalMs()) {
-        stats.result = Result::RateLimited;
-        return stats;  // deliberately does not overwrite gLastStats
-    }
-    gLastAttemptMs = started;
-
-    if (radiusNm < 1) radiusNm = 1;
-    if (radiusNm > kMaxRadiusNm) radiusNm = kMaxRadiusNm;
-
     char url[160];
-    buildUrl(url, sizeof(url), lat, lon, radiusNm);
+    buildUrl(url, sizeof(url), p, lat, lon, radiusNm);
 
     // Transport. A receiver on the LAN is plain HTTP: there is nothing secret
     // in the request, no certificate anybody could usefully check, and the
@@ -425,32 +435,161 @@ FetchStats fetch(Tracker &tracker, double lat, double lon, uint16_t radiusNm) {
     // constructs a client, so a local poll never touches mbedtls -- but both
     // branches are compiled now that the choice is a runtime one, which is
     // what the TLS stack costs us in flash.
-    if (isLocal()) {
+    if (p == AdsbProvider::LOCAL) {
         WiFiClient client;
-        stats = runFetch(client, url, tracker, lat, lon, radiusNm, started);
-    } else {
-        WiFiClientSecure client;
-        // These are public, read-only, unauthenticated feeds and the board has
-        // no way to refresh a pinned root as the providers rotate
-        // certificates. We accept any certificate rather than ship a root that
-        // silently expires; nothing secret is sent and the payload is
-        // sanity-checked after parsing.
-        client.setInsecure();
-        client.setTimeout(httpTimeoutMs() / 1000);
-        stats = runFetch(client, url, tracker, lat, lon, radiusNm, started);
+        return runFetch(client, url, p, into, lat, lon, radiusNm, started);
     }
 
-    if (stats.result == Result::Ok) {
-        gLastSuccessMs = millis();
-        log_i("adsb: %u aircraft in %ums (%u filtered)", stats.stored,
-              stats.durationMs, stats.filtered);
-    }
-    gLastStats = stats;
-    return stats;
+    WiFiClientSecure client;
+    // These are public, read-only, unauthenticated feeds and the board has no
+    // way to refresh a pinned root as the providers rotate certificates. We
+    // accept any certificate rather than ship a root that silently expires;
+    // nothing secret is sent and the payload is sanity-checked after parsing.
+    client.setInsecure();
+    client.setTimeout(httpTimeoutMs(p) / 1000);
+    return runFetch(client, url, p, into, lat, lon, radiusNm, started);
 }
 
+// ---------------------------------------------------------- the handoff ----
+//
+// Idle -> Running is written by the loop task and read by the fetch task;
+// Running -> Done goes the other way. Acquire/release rather than plain
+// volatile so the compiler cannot hoist the buffer accesses either side of it
+// across the state change -- the whole safety of the arrangement is that
+// exactly one task owns the staging store at a time, and the state word is
+// what says which.
+enum class State : uint8_t { Idle, Running, Done };
+std::atomic<State> gState{State::Idle};
+
+struct Request {
+    double lat = 0.0;
+    double lon = 0.0;
+    uint16_t radiusNm = 0;
+    AdsbProvider provider = ADSB_PROVIDER_DEFAULT;
+};
+Request gRequest;          // written while Idle, read while Running
+FetchStats gResultStats;   // written while Running, read while Done
+Tracker gStaging;          // same ownership rule as the two above
+
+TaskHandle_t gTask = nullptr;
+SemaphoreHandle_t gWake = nullptr;
+
+// Deep enough for an mbedtls handshake, which is comfortably the deepest thing
+// this firmware does. The JSON arena is in PSRAM and the receive buffer is
+// static, so almost all of this is TLS. Watch it on the diagnostics page.
+constexpr uint32_t kTaskStackBytes = 12288;
+// Same priority as the Arduino loop task, and the same core it runs on --
+// which is the whole point: this is exactly where the fetch already ran, so
+// nothing about how it is scheduled changes. Only the blocking does. The two
+// tasks share the core by round-robin while both are runnable, and the fetch
+// spends nearly all of its time not runnable at all, parked on a socket.
+//
+// The other core is tempting and wrong. Its idle task is the one the task
+// watchdog watches -- the Arduino core exempts core 1 precisely because
+// loop() hogs it -- so a parse that ran long there would trip a reset that
+// the same parse on this core does not. It is also where the Wi-Fi stack
+// lives, at priorities far above this, feeding the very socket we would be
+// waiting on.
+constexpr UBaseType_t kTaskPriority = 1;
+constexpr BaseType_t kTaskCore = ARDUINO_RUNNING_CORE;
+
+void fetchTask(void *) {
+    for (;;) {
+        xSemaphoreTake(gWake, portMAX_DELAY);
+
+        gStaging.clear();
+        // The staging store applies the same nearest-first eviction the live
+        // one does, so what crosses back is already the nearest MAX_AIRCRAFT
+        // of the snapshot rather than the first MAX_AIRCRAFT of it.
+        gStaging.setCentre(gRequest.lat, gRequest.lon);
+
+        gResultStats = fetchBlocking(gRequest.provider, gRequest.lat,
+                                     gRequest.lon, gRequest.radiusNm, gStaging);
+
+        gState.store(State::Done, std::memory_order_release);
+    }
+}
+
+}  // namespace
+
+void begin() {
+    if (gTask) return;
+    gWake = xSemaphoreCreateBinary();
+    if (!gWake) {
+        log_e("adsb: no semaphore for the fetch task");
+        return;
+    }
+    if (xTaskCreatePinnedToCore(fetchTask, "adsb", kTaskStackBytes, nullptr,
+                                kTaskPriority, &gTask, kTaskCore) != pdPASS) {
+        gTask = nullptr;
+        log_e("adsb: fetch task would not start");
+    }
+}
+
+bool busy() { return gState.load(std::memory_order_acquire) != State::Idle; }
+
+bool ready() { return gState.load(std::memory_order_acquire) == State::Done; }
+
+bool request(double lat, double lon, uint16_t radiusNm) {
+    if (!gTask) return false;
+    if (gState.load(std::memory_order_acquire) != State::Idle) return false;
+    if (WiFi.status() != WL_CONNECTED) return false;
+
+    const uint32_t now = millis();
+    if (gLastAttemptMs != 0 && now - gLastAttemptMs < minIntervalMs()) {
+        return false;
+    }
+    gLastAttemptMs = now;
+
+    if (radiusNm < 1) radiusNm = 1;
+    if (radiusNm > kMaxRadiusNm) radiusNm = kMaxRadiusNm;
+
+    gRequest.lat = lat;
+    gRequest.lon = lon;
+    gRequest.radiusNm = radiusNm;
+    // Latched here rather than read on the task: the 'p' key can land while a
+    // fetch is in flight, and a response parsed against the other provider's
+    // array name would come back empty for no visible reason.
+    gRequest.provider = gProvider;
+
+    gState.store(State::Running, std::memory_order_release);
+    xSemaphoreGive(gWake);
+    return true;
+}
+
+bool collect(Tracker &tracker, FetchStats *stats) {
+    if (gState.load(std::memory_order_acquire) != State::Done) return false;
+
+    FetchStats result = gResultStats;
+
+    // Bounded by MAX_AIRCRAFT and no strings are parsed, so this is a couple
+    // of milliseconds on the loop task -- against the second and a half of
+    // socket, handshake and JSON the fetch task has just spent on the other
+    // core. The tracker is only ever touched from here, which is what keeps
+    // the rest of the firmware free of locks.
+    const uint32_t now = millis();
+    for (size_t i = 0; i < gStaging.count(); ++i) {
+        if (!tracker.upsert(gStaging.at(i), now)) ++result.dropped;
+    }
+
+    if (result.result == Result::Ok) {
+        gLastSuccessMs = millis();
+        log_i("adsb: %u aircraft in %ums (%u filtered)", result.stored,
+              result.durationMs, result.filtered);
+    }
+    gLastStats = result;
+    if (stats) *stats = result;
+
+    gState.store(State::Idle, std::memory_order_release);
+    return true;
+}
 
 uint32_t lastSuccessMs() { return gLastSuccessMs; }
 const FetchStats &lastStats() { return gLastStats; }
+
+uint32_t taskHeadroomBytes() {
+    if (!gTask) return 0;
+    return static_cast<uint32_t>(uxTaskGetStackHighWaterMark(gTask));
+}
 
 }  // namespace adsb

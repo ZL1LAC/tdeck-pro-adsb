@@ -18,7 +18,13 @@ constexpr uint32_t kBackoffMaxMs = 60000;
 
 void startAttempt(uint32_t now) {
     if (kWifiNetworkCount == 0) {
+        // Nothing to associate with. Park with a retry far in the future
+        // rather than returning straight back here on every poll() for the
+        // life of the run -- and say so, because the alternative symptom is a
+        // radio that silently never comes up.
+        log_e("wifi: secrets.h configures no networks");
         gState = State::Failed;
+        gRetryAtMs = now + kBackoffMaxMs;
         return;
     }
     const WifiCredential &cred = kWifiNetworks[gCandidate % kWifiNetworkCount];

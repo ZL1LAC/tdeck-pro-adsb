@@ -95,6 +95,15 @@ float gPanNorthNm = 0.0f;
 int16_t gTouchDownX = 0;
 int16_t gTouchDownY = 0;
 int gListTop = 0;
+
+// The diagnostics page has more rows than the panel has lines -- 28 against
+// the 21 that fit -- so it scrolls. Kept as a row index rather than pixels so
+// a row can never be half drawn. gStatusRows is what the last draw counted,
+// which is what the scroll clamps against: several rows are conditional, so
+// the total is not a constant anybody can write down here.
+int gStatusTop = 0;
+int gStatusRows = 0;
+
 bool gRefreshRequested = false;
 bool gCentreOnGnss = GNSS_CENTRE_BY_DEFAULT;
 bool gMapEnabled = MAP_ENABLED_BY_DEFAULT;
@@ -329,12 +338,29 @@ char verticalTrendChar(const Aircraft &a) {
     return ' ';
 }
 
+// One projection origin per own-position change rather than one per call.
+// geo::projectNm() takes a cos() in double every time it is asked, and the
+// radar asks it once per target to plot, once per target to fingerprint, and
+// once per target on every tap -- all about the same centre. Tracker::
+// sceneHash() hoists the same way, which is what keeps the pixel the hash
+// quantises to and the pixel the renderer draws on the same one.
+const geo::Projector &ownProjector() {
+    static double lat = 91.0, lon = 181.0;  // impossible: forces a first build
+    static geo::Projector projector(0.0, 0.0);
+    if (lat != gCtx.ownLat || lon != gCtx.ownLon) {
+        lat = gCtx.ownLat;
+        lon = gCtx.ownLon;
+        projector = geo::Projector(lat, lon);
+    }
+    return projector;
+}
+
 // Screen position of a target on the radar. Returns false when it falls
 // outside the plotted range.
 bool radarPosition(const Aircraft &a, int16_t *sx, int16_t *sy) {
     if (!a.hasPosition) return false;
     float east = 0.0f, north = 0.0f;
-    geo::projectNm(gCtx.ownLat, gCtx.ownLon, a.lat, a.lon, &east, &north);
+    ownProjector().project(a.lat, a.lon, &east, &north);
     east -= gPanEastNm;
     north -= gPanNorthNm;
 
@@ -632,12 +658,29 @@ void drawRadar() {
     }
 
     // The range now reads out in the status bar, so all this corner has left
-    // to say is how much traffic falls outside the plot.
-    const int hidden = static_cast<int>(gCtx.tracker->count()) - plotted;
-    if (hidden > 0) {
-        snprintf(buf, sizeof(buf), "+%d out", hidden);
-        textRight(SCREEN_W - 2, CONTENT_Y + 2, buf);
+    // to say is what the plot is not showing you -- and there are two quite
+    // different reasons for that. One is traffic past the outer ring, which
+    // zooming out would bring in. The other never reported a position at all,
+    // which no amount of zooming will fix. Counting them together made a feed
+    // full of positionless targets read as a sky full of traffic just off the
+    // edge of the screen.
+    const int total = static_cast<int>(gCtx.tracker->count());
+    const int noPosition =
+        total - static_cast<int>(gCtx.tracker->positionCount());
+    const int beyondRange = total - plotted - noPosition;
+    // Its own buffer rather than the shared one: both counts are bounded
+    // by MAX_AIRCRAFT, but the compiler cannot know that and sizes the
+    // worst case at two ten-digit integers.
+    char corner[40] = {0};
+    if (beyondRange > 0 && noPosition > 0) {
+        snprintf(corner, sizeof(corner), "+%d out +%d nopos", beyondRange,
+                 noPosition);
+    } else if (beyondRange > 0) {
+        snprintf(corner, sizeof(corner), "+%d out", beyondRange);
+    } else if (noPosition > 0) {
+        snprintf(corner, sizeof(corner), "+%d nopos", noPosition);
     }
+    if (corner[0]) textRight(SCREEN_W - 2, CONTENT_Y + 2, corner);
 
     drawRadarButtons();
 
@@ -856,15 +899,26 @@ void drawDetail() {
 // -------------------------------------------------------- status view ------
 void drawStatus() {
     char buf[64];
-    int16_t y = CONTENT_Y + 6;
+    const int16_t heading = CONTENT_Y + 6;
 
-    textAt(4, y, "Diagnostics", BLACK, 2);
-    y += 22;
+    textAt(4, heading, "Diagnostics", BLACK, 2);
 
+    // The heading stays put and the rows scroll under it.
+    constexpr int16_t kRowH = 12;
+    const int16_t top = CONTENT_Y + 28;
+    const int visible = (FOOTER_Y - top) / kRowH;
+
+    // Every row is offered; only the ones inside the window are drawn. Doing
+    // it this way rather than skipping the work means the count at the end is
+    // the true total, conditional rows included, which is what the scroll
+    // needs to know how far down it may go.
+    int index = 0;
     auto row = [&](const char *label, const char *value) {
+        const int i = index++;
+        if (i < gStatusTop || i >= gStatusTop + visible) return;
+        const int16_t y = static_cast<int16_t>(top + (i - gStatusTop) * kRowH);
         textAt(4, y, label);
         textAt(4 + 11 * CHAR_W, y, value);
-        y += 12;
     };
 
     row("Firmware", "adsb 0.1");
@@ -872,18 +926,30 @@ void drawStatus() {
 
     const adsb::FetchStats &f = gCtx.lastFetch;
     switch (f.result) {
-        case adsb::Result::Ok:
+        case adsb::Result::Ok: {
             // A local receiver serves everything it hears, so the count it
-            // sent and the count we kept are different numbers worth seeing.
+            // sent and the count we kept are different numbers worth seeing --
+            // as is the count the store had no room for, which is the only
+            // warning that MAX_AIRCRAFT, rather than the antenna, is now the
+            // limit on what you can see.
+            // snprintf() reports what it would have written, so the offset
+            // is clamped before it is used as one: an unclamped overrun would
+            // turn sizeof(buf) - n into a very large size_t.
+            size_t n = static_cast<size_t>(snprintf(buf, sizeof(buf), "ok %u ac",
+                                                    static_cast<unsigned>(f.stored)));
+            if (n >= sizeof(buf)) n = sizeof(buf) - 1;
             if (f.filtered > 0) {
-                snprintf(buf, sizeof(buf), "ok %u ac -%u far",
-                         static_cast<unsigned>(f.stored),
-                         static_cast<unsigned>(f.filtered));
-            } else {
-                snprintf(buf, sizeof(buf), "ok %u ac",
-                         static_cast<unsigned>(f.stored));
+                n += static_cast<size_t>(
+                    snprintf(buf + n, sizeof(buf) - n, " -%u far",
+                             static_cast<unsigned>(f.filtered)));
+                if (n >= sizeof(buf)) n = sizeof(buf) - 1;
+            }
+            if (f.dropped > 0) {
+                snprintf(buf + n, sizeof(buf) - n, " -%u full",
+                         static_cast<unsigned>(f.dropped));
             }
             break;
+        }
         case adsb::Result::HttpError:
             snprintf(buf, sizeof(buf), "HTTP %d", f.httpStatus);
             break;
@@ -892,9 +958,6 @@ void drawStatus() {
             break;
         case adsb::Result::NotConnected:
             snprintf(buf, sizeof(buf), "no network");
-            break;
-        case adsb::Result::RateLimited:
-            snprintf(buf, sizeof(buf), "throttled");
             break;
     }
     row("Last poll", buf);
@@ -909,6 +972,20 @@ void drawStatus() {
 
     snprintf(buf, sizeof(buf), "%lu ms", static_cast<unsigned long>(f.durationMs));
     row("Poll time", buf);
+
+    // The fetch runs on its own task now, and a TLS handshake is the deepest
+    // thing this firmware does. An overflow there would look like a reboot
+    // with no other explanation, so the headroom is worth a line.
+    const uint32_t headroom = adsb::taskHeadroomBytes();
+    if (headroom == 0) {
+        snprintf(buf, sizeof(buf), "NOT RUNNING");
+    } else if (adsb::busy()) {
+        snprintf(buf, sizeof(buf), "fetching");
+    } else {
+        snprintf(buf, sizeof(buf), "idle, %u B free",
+                 static_cast<unsigned>(headroom));
+    }
+    row("Feed task", buf);
 
     row("SSID", gCtx.wifiConnected ? gCtx.wifiSsid : "not connected");
     row("IP", gCtx.wifiConnected ? gCtx.ipAddress : "--");
@@ -1026,7 +1103,30 @@ void drawStatus() {
              static_cast<unsigned>(ESP.getFreePsram() / 1024));
     row("Free RAM", buf);
 
-    drawFooterLines("U:back  g:GNSS centre  l:backlight", nullptr);
+    // Largest contiguous block of each heap. Free bytes alone cannot tell you
+    // the arena is about to fail to allocate; this and the line above drifting
+    // apart is what fragmentation looks like from the outside.
+    snprintf(buf, sizeof(buf), "%u k / %u k",
+             static_cast<unsigned>(
+                 heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) / 1024),
+             static_cast<unsigned>(
+                 heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) / 1024));
+    row("Max block", buf);
+
+    gStatusRows = index;
+
+    // Same scroll indicator the list view uses, so the two pages read the same
+    // way -- and so there is something on screen saying the page continues.
+    if (index > visible) {
+        const int16_t trackH = static_cast<int16_t>(visible * kRowH);
+        int16_t barH = static_cast<int16_t>(trackH * visible / index);
+        if (barH < 4) barH = 4;
+        const int16_t barY = static_cast<int16_t>(
+            top + (trackH - barH) * gStatusTop / (index - visible));
+        g().fillRect(SCREEN_W - 3, barY, 3, barH, BLACK);
+    }
+
+    drawFooterLines("U:back  w/s:scroll", "g:GNSS centre  l:backlight");
 }
 
 void drawCurrentView() {
@@ -1039,10 +1139,29 @@ void drawCurrentView() {
     }
 }
 
+// Clamped against what the last draw actually counted, so a page that grows
+// a row stays reachable without anybody updating a constant.
+void scrollStatus(int delta) {
+    const int visible = (FOOTER_Y - (CONTENT_Y + 28)) / 12;
+    int maxTop = gStatusRows - visible;
+    if (maxTop < 0) maxTop = 0;
+
+    int next = gStatusTop + delta;
+    if (next < 0) next = 0;
+    if (next > maxTop) next = maxTop;
+    if (next == gStatusTop) return;  // already at the end: do not spend a refresh
+
+    gStatusTop = next;
+    display::invalidate();
+}
+
 void setView(View v) {
     if (v == gView) return;
     gPreviousView = gView;
     gView = v;
+    // Always arrive at the top of the diagnostics rather than wherever it was
+    // left, which from the outside looks like a page with its head cut off.
+    if (v == View::Status) gStatusTop = 0;
     // A view change replaces the whole screen, so clear the ghosting with it.
     display::invalidate(true);
 }
@@ -1102,6 +1221,8 @@ void handleKey(char key) {
         case 'w':
             if (gView == View::Radar) {
                 panByNm(0.0f, panStepNm());
+            } else if (gView == View::Status) {
+                scrollStatus(-1);
             } else {
                 moveSelection(-1);
                 display::invalidate();
@@ -1110,6 +1231,8 @@ void handleKey(char key) {
         case 's':
             if (gView == View::Radar) {
                 panByNm(0.0f, -panStepNm());
+            } else if (gView == View::Status) {
+                scrollStatus(1);
             } else {
                 moveSelection(1);
                 display::invalidate();
@@ -1134,12 +1257,20 @@ void handleKey(char key) {
             break;
 
         case 'k':
-            moveSelection(-1);
-            display::invalidate();
+            if (gView == View::Status) {
+                scrollStatus(-1);
+            } else {
+                moveSelection(-1);
+                display::invalidate();
+            }
             break;
         case 'j':
-            moveSelection(1);
-            display::invalidate();
+            if (gView == View::Status) {
+                scrollStatus(1);
+            } else {
+                moveSelection(1);
+                display::invalidate();
+            }
             break;
 
         case keypad::kEnter:
@@ -1301,6 +1432,15 @@ void handleTouch(const touch::Event &event) {
     if (gView == View::Radar && gTouchDownY >= STATUS_H && gTouchDownY < FOOTER_Y) {
         const float scale = pixelsPerNm();
         panByNm(-dx / scale, dy / scale);
+        return;
+    }
+
+    // The diagnostics page is taller than the panel. A tap on it still means
+    // back -- that is what its footer says -- but a drag is already told apart
+    // from a tap above, so it can scroll, content following the finger the
+    // same way the radar does.
+    if (gView == View::Status && gTouchDownY >= STATUS_H && gTouchDownY < FOOTER_Y) {
+        scrollStatus(-dy / 12);
     }
 }
 
@@ -1324,6 +1464,7 @@ bool tick() {
     mix(static_cast<uint32_t>(static_cast<int32_t>(gPanEastNm * 10.0f)));
     mix(static_cast<uint32_t>(static_cast<int32_t>(gPanNorthNm * 10.0f)));
     mix(static_cast<uint32_t>(gListTop));
+    mix(static_cast<uint32_t>(gStatusTop));
     mix(static_cast<uint32_t>(gMapEnabled));
     // The basemap and our own crosshair move with our position even when no
     // aircraft do, so it has to be in the fingerprint -- at the same pixel
