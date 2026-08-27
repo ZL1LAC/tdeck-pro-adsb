@@ -19,6 +19,21 @@ uint32_t gBaud = 0;
 const uint32_t kBaudCandidates[] = {38400, 9600, 115200, 57600};
 constexpr uint32_t kProbeWindowMs = 400;
 
+// The UART ring holds 256 bytes unless told otherwise, which at 38400 baud is
+// 67 ms of NMEA -- a tenth of one panel refresh, and a twentieth of one
+// aggregator poll, both of which block the loop that drains it. Dropping
+// sentences does not cost a fix, since the module holds that itself, but it
+// does delay us noticing one, and noticing is what the duty cycle is timing
+// against. Two kilobytes buys half a second of slack for one page of DRAM.
+constexpr size_t kRxBufferBytes = 2048;
+
+// setRxBufferSize() is only honoured while the driver is uninstalled, so it
+// has to be re-applied ahead of every begin() rather than set once.
+void openSerial(uint32_t baud) {
+    gSerial.setRxBufferSize(kRxBufferBytes);
+    gSerial.begin(baud, SERIAL_8N1, BOARD_GPS_RXD, BOARD_GPS_TXD);
+}
+
 // -- power policy -----------------------------------------------------------
 //
 // The plot centre is the only thing that needs a position, and it is a
@@ -53,7 +68,7 @@ uint32_t gSatellites = 0;
 
 // Listen briefly for anything that looks like NMEA.
 bool probe(uint32_t baud) {
-    gSerial.begin(baud, SERIAL_8N1, BOARD_GPS_RXD, BOARD_GPS_TXD);
+    openSerial(baud);
     const uint32_t deadline = millis() + kProbeWindowMs;
     int sentenceStarts = 0;
     while (millis() < deadline) {
@@ -71,8 +86,7 @@ void powerOn() {
     // The baud rate was settled during begin(), so there is nothing to probe:
     // just reopen the port. The module needs a moment before it says anything,
     // which costs nothing here because poll() is called continuously.
-    gSerial.begin(gBaud ? gBaud : kBaudCandidates[0], SERIAL_8N1, BOARD_GPS_RXD,
-                  BOARD_GPS_TXD);
+    openSerial(gBaud ? gBaud : kBaudCandidates[0]);
     gState = State::Acquiring;
     gAcquireStartMs = millis();
     gPoweredSinceMs = gAcquireStartMs;
@@ -132,7 +146,7 @@ void begin() {
 
     // Nothing recognisable. Leave the port open at the most likely rate so a
     // module that simply needed longer to boot still gets picked up.
-    gSerial.begin(kBaudCandidates[0], SERIAL_8N1, BOARD_GPS_RXD, BOARD_GPS_TXD);
+    openSerial(kBaudCandidates[0]);
     gBaud = 0;
     log_w("GNSS did not answer during probe; defaulting to 38400 baud");
 }

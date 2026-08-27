@@ -37,8 +37,8 @@ enum class AdsbProvider : uint8_t { ADSB_LOL, ADSB_FI, AIRPLANES_LIVE, LOCAL };
 // to. The choice is made at runtime rather than compiled in, so both
 // transports have to be linked: that costs about 120 KB of flash in mbedtls
 // which a LOCAL-only build does not pay. Worth it for being able to walk out
-// of Wi-Fi range and still see traffic. There is no NVS yet, so a toggle lasts
-// until the next reboot.
+// of Wi-Fi range and still see traffic. A toggle is kept in NVS, so the feed
+// you were last on is the one you come back up on.
 #define ADSB_PROVIDER_DEFAULT AdsbProvider::LOCAL
 #define ADSB_PROVIDER_REMOTE  AdsbProvider::ADSB_FI
 
@@ -83,8 +83,17 @@ enum class AdsbProvider : uint8_t { ADSB_LOL, ADSB_FI, AIRPLANES_LIVE, LOCAL };
 // credentials -- an address is worth keeping out of a public repository too.
 // They are used until the GNSS gets a fix, and whenever GNSS centring is off.
 
-// Set false to save ~30 mA if you always want the fixed home position.
-#define GNSS_ENABLED true
+// The receiver is off. It is the largest continuous draw on the board, and on
+// a unit that lives at a fixed address it spends its life confirming a
+// position config.h already knows -- so the rail is held down from
+// power::begin() and gnss::begin() returns without touching the UART.
+//
+// Everything below still works if you set this true: the duty cycle, the
+// acquire/sleep state machine, the 'g' key. Two things change when it is
+// false. The plot centre is always HOME_LATITUDE / HOME_LONGITUDE, and the
+// clock loses its off-grid source -- it is then SNTP or the retained RTC only,
+// so a board with no Wi-Fi and no recent reboot shows --:--.
+#define GNSS_ENABLED false
 #define GNSS_CENTRE_BY_DEFAULT true
 
 // GNSS duty cycle. The module is the largest continuous draw on the board and
@@ -187,3 +196,14 @@ static const size_t kRangeStepCount = sizeof(kRangeStepsNm) / sizeof(kRangeSteps
 
 // Keyboard backlight on at boot.
 #define KEYPAD_BACKLIGHT_DEFAULT false
+
+// =========================================================== Diagnostics ===
+// Seconds between heap lines on the serial log; 0 keeps it quiet.
+//
+// The number worth watching is not free bytes but the largest contiguous
+// block, and the gap between the two is fragmentation. It matters here because
+// the feed allocates and frees a variable-size JSON arena in PSRAM roughly
+// once a second against a local receiver -- a pattern that can leave a heap
+// with megabytes free and no room for the next parse, days into a run, which
+// is exactly when nobody is watching.
+#define DIAG_HEAP_LOG_INTERVAL_MS 60000UL
