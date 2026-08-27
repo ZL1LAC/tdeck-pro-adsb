@@ -15,12 +15,20 @@ class Tracker {
     void clear();
 
     // Merge one aircraft from a feed snapshot. Matching is by ICAO hex.
-    // Returns false only if the store is full and the target is unknown.
+    //
+    // Returns false only when the store is full, the target is unknown, and it
+    // is no nearer than the farthest one already held -- see evictFor().
     bool upsert(const Aircraft &incoming, uint32_t nowMs);
 
     // Drop entries older than AIRCRAFT_STALE_MS, recompute range/bearing
     // against the given centre, and sort nearest-first.
     void finishUpdate(double centreLat, double centreLon, uint32_t nowMs);
+
+    // Where upsert() should measure from when it has to choose which of two
+    // targets to keep. finishUpdate() sets this as a side effect; a store that
+    // is filled before its first finishUpdate() -- the feed's staging copy --
+    // has to be told up front.
+    void setCentre(double lat, double lon);
 
     size_t count() const { return count_; }
     const Aircraft &at(size_t i) const { return items_[i]; }
@@ -55,6 +63,14 @@ class Tracker {
     size_t count_ = 0;
     size_t positionCount_ = 0;
 
+    // Where ranges were last measured from, remembered so upsert() can work
+    // out which of two targets is the nearer one without being told again.
+    double centreLat_ = 0.0;
+    double centreLon_ = 0.0;
+    bool haveCentre_ = false;
+
     int findSlot(const char *hex) const;
+    // Which slot a target should take when the store is full, or -1 to refuse.
+    int evictFor(const Aircraft &incoming) const;
     void sortByDistance();
 };

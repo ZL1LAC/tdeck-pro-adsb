@@ -26,6 +26,10 @@ class Projector {
     Projector(double lat0, double lon0);
     void project(int32_t latE7, int32_t lonE7, float *eastNm,
                  float *northNm) const;
+    // Same projection for the degrees the tracker holds. Quantising to 1e-7
+    // of a degree costs about a centimetre, which is well past anything a
+    // 240-pixel plot or a 0.1 nm read-out can show.
+    void project(double lat, double lon, float *eastNm, float *northNm) const;
 
    private:
     int32_t lat0E7_;

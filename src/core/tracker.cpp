@@ -20,6 +20,12 @@ void Tracker::clear() {
     positionCount_ = 0;
 }
 
+void Tracker::setCentre(double lat, double lon) {
+    centreLat_ = lat;
+    centreLon_ = lon;
+    haveCentre_ = true;
+}
+
 int Tracker::findSlot(const char *hex) const {
     for (size_t i = 0; i < count_; ++i) {
         if (strcmp(items_[i].hex, hex) == 0) return static_cast<int>(i);
@@ -27,15 +33,55 @@ int Tracker::findSlot(const char *hex) const {
     return -1;
 }
 
+// The store is full and this is not a target we already hold. A snapshot
+// arrives in whatever order the feed serialises it, so keeping the first
+// MAX_AIRCRAFT of it keeps an arbitrary subset -- and the one thing a radar
+// must not do is discard the traffic nearest you in favour of something at the
+// far edge of the query. So the slot is given away only to a nearer target.
+//
+// Entries with no position are parked at 1e9 nm, so anything that reported one
+// outbids them. That is the right order: a target that cannot be plotted is
+// the cheapest one to lose.
+int Tracker::evictFor(const Aircraft &incoming) const {
+    if (!haveCentre_ || !incoming.hasPosition || count_ == 0) return -1;
+
+    const float want = static_cast<float>(
+        geo::distanceNm(centreLat_, centreLon_, incoming.lat, incoming.lon));
+
+    size_t worst = 0;
+    float worstNm = items_[0].distanceNm;
+    for (size_t i = 1; i < count_; ++i) {
+        if (items_[i].distanceNm > worstNm) {
+            worstNm = items_[i].distanceNm;
+            worst = i;
+        }
+    }
+    if (worstNm <= want) return -1;
+    return static_cast<int>(worst);
+}
+
 bool Tracker::upsert(const Aircraft &incoming, uint32_t nowMs) {
     if (!incoming.hex[0]) return true;  // nothing usable, but not an overflow
 
     int slot = findSlot(incoming.hex);
     if (slot < 0) {
-        if (count_ >= MAX_AIRCRAFT) return false;
-        slot = static_cast<int>(count_++);
+        if (count_ >= MAX_AIRCRAFT) {
+            slot = evictFor(incoming);
+            if (slot < 0) return false;
+        } else {
+            slot = static_cast<int>(count_++);
+        }
         items_[slot] = incoming;
         items_[slot].lastUpdateMs = nowMs;
+        // finishUpdate() fills this in for everything at the end of the poll,
+        // but the rest of this same snapshot has to be able to outbid the
+        // entry before then -- and the zero Aircraft{} leaves here would read
+        // as "directly overhead", making a new arrival unevictable.
+        items_[slot].distanceNm =
+            (haveCentre_ && incoming.hasPosition)
+                ? static_cast<float>(geo::distanceNm(centreLat_, centreLon_,
+                                                     incoming.lat, incoming.lon))
+                : 1.0e9f;
         return true;
     }
 
@@ -66,6 +112,10 @@ bool Tracker::upsert(const Aircraft &incoming, uint32_t nowMs) {
 }
 
 void Tracker::finishUpdate(double centreLat, double centreLon, uint32_t nowMs) {
+    centreLat_ = centreLat;
+    centreLon_ = centreLon;
+    haveCentre_ = true;
+
     // Age out stale targets by compacting the array in place.
     size_t write = 0;
     for (size_t read = 0; read < count_; ++read) {
@@ -114,6 +164,12 @@ int Tracker::indexOfHex(const char *hex) const {
 
 uint32_t Tracker::sceneHash(double centreLat, double centreLon,
                             float pixelsPerNm) const {
+    // Hoisted out of the loop: geo::projectNm() takes a cos() in double for
+    // every call it is given, and this used to ask for one per aircraft, twice
+    // a second, for a centre that changes at walking pace. Same reason the
+    // basemap projects through one of these rather than several thousand.
+    const geo::Projector projector(centreLat, centreLon);
+
     // FNV-1a per aircraft, summed rather than chained so the result does not
     // depend on the order the array happens to be sorted into.
     uint32_t acc = 0;
@@ -142,7 +198,7 @@ uint32_t Tracker::sceneHash(double centreLat, double centreLon,
                 // Exactly the projection the renderer uses, rounded to the
                 // pixel it would land on.
                 float east = 0.0f, north = 0.0f;
-                geo::projectNm(centreLat, centreLon, a.lat, a.lon, &east, &north);
+                projector.project(a.lat, a.lon, &east, &north);
                 mix(static_cast<uint32_t>(lroundf(east * pixelsPerNm)));
                 mix(static_cast<uint32_t>(lroundf(north * pixelsPerNm)));
             } else {

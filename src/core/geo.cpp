@@ -63,6 +63,12 @@ void Projector::project(int32_t latE7, int32_t lonE7, float *eastNm,
     if (northNm) *northNm = static_cast<float>(latE7 - lat0E7_) * northScale_;
 }
 
+void Projector::project(double lat, double lon, float *eastNm,
+                        float *northNm) const {
+    project(static_cast<int32_t>(lat * 1e7), static_cast<int32_t>(lon * 1e7),
+            eastNm, northNm);
+}
+
 void offsetNm(double lat0, double lon0, float eastNm, float northNm,
               double *lat, double *lon) {
     if (lat) *lat = lat0 + northNm / 60.0;
