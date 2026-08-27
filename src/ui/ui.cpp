@@ -754,7 +754,7 @@ void drawDetail() {
                                  ? static_cast<size_t>(split)
                                  : sizeof(line) - 1;
             memcpy(line, db.desc, n);
-            line[n] = ' ';
+            line[n] = '\0';
             textAt(4, y, line);
             y += 10;
             textAt(4, y, db.desc + split + (db.desc[split] == ' ' ? 1 : 0));
