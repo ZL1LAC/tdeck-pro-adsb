@@ -115,7 +115,9 @@ Keyboard:
 | `i` | Diagnostics page |
 
 In the list and detail views there is nothing to pan, so `w`/`s` move the
-selection there instead.
+selection there instead. On the diagnostics page they scroll it: there are 28
+rows and the panel fits 21, so the page runs past the bottom of the screen and
+carries the same scroll indicator down its right edge that the list does.
 
 Touch:
 
@@ -126,6 +128,8 @@ Touch:
 - **On the detail and diagnostics pages, a tap anywhere goes back** -- body,
   status bar or footer. Those pages have nothing to select and no views to swap
   between, and their footers say `U:back`.
+- **Drag the diagnostics page** to scroll it. A drag is already told apart from
+  a tap by the same threshold the radar uses, so the two do not collide.
 - **`+` / `−` buttons** in the bottom corners zoom. Once panned, a crosshair
   button appears top-left to recentre.
 
@@ -162,8 +166,8 @@ that and `ADSB_PROVIDER_REMOTE` at runtime, so you can walk out of Wi-Fi range
 and keep seeing traffic. The radar footer names whichever is live. Two things
 follow from the swap being a runtime choice rather than a compiled-in one:
 both transports are linked, which costs about 120 KB of flash in mbedtls that a
-local-only build would not pay; and there is no NVS yet, so the choice lasts
-until the next reboot.
+local-only build would not pay. The choice is kept in NVS, so the feed you
+were last on is the one you come back up on.
 
 Switching leaves the old feed's targets to age out rather than clearing them.
 They merge by ICAO hex and `mergeString()` only overwrites a field that arrives
@@ -324,7 +328,7 @@ pio run -t uploadfs
 ```
 
 The full database is 615k records and 30 MB uncompressed, which neither fits a
-3.4 MB SPIFFS partition nor needs to — an aircraft has to be within radio range
+11.9 MB SPIFFS partition nor needs to — an aircraft has to be within radio range
 to appear on the plot, so only the ICAO address blocks you can actually hear are
 worth carrying.
 
@@ -415,6 +419,18 @@ what a mistaken winding rule looks like.
 
 ## GNSS power
 
+**The receiver ships disabled.** `GNSS_ENABLED` is `false` in
+[config.h](include/config.h): the rail is held down from `power::begin()` and
+`gnss::begin()` returns without opening the UART. On a board that lives at a
+fixed address it spent its life confirming a position `config.h` already knew.
+The plot centre is then always `HOME_LATITUDE` / `HOME_LONGITUDE`, and the
+clock loses its off-grid source — SNTP or the retained RTC only, so a unit with
+no Wi-Fi and no recent reboot shows `--:--`.
+
+Set it `true` and everything below is exactly as described; none of the
+machinery went anywhere. The rest of this section is why it is worth having
+when you do want it.
+
 The MIA-M10Q is the largest continuous draw on the board, and it is powered for
 a position that barely changes. So it is not held on for its own sake.
 
@@ -477,20 +493,20 @@ src/
     gnss.{h,cpp}        MIA-M10Q with UART baud probing
   net/
     net.{h,cpp}         Wi-Fi association with backoff across several SSIDs
-    adsb_source.{h,cpp} HTTPS GET + filtered streaming JSON parse
+    adsb_source.{h,cpp} the fetch task: HTTP(S) GET + filtered streaming parse
   ui/
     display.{h,cpp}     GxEPD2 wrapper and the refresh policy
     icons.{h,cpp}       type designator -> plan-view silhouette
     ui.{h,cpp}          views, input handling, layout
 ```
 
-Four design points worth knowing:
+Five design points worth knowing:
 
 **Nothing repaints unless it changed.** `Tracker::sceneHash()` fingerprints
 everything the renderer draws, quantised so GPS jitter does not count as change.
 `display::render()` compares it against the frame already on the glass and
-returns early on a match, and enforces a 4 s floor between refreshes on top of
-that. Every 20th repaint (or after 10 minutes) is promoted from a partial to a
+returns early on a match, and enforces a 2 s floor between refreshes on top of
+that. Every 60th repaint (or after 10 minutes) is promoted from a partial to a
 full refresh to clear ghosting.
 
 Both halves of that matter, and the trap is easy to fall into twice. The first
@@ -499,14 +515,14 @@ between reads, so the frame genuinely differed every loop and the panel
 repainted about 1.4 times a second. Signal strength is now four bars with 3 dB
 of hysteresis. The satellite count sat in the same hash and did the same thing
 — an open-sky constellation gains and loses a satellite most seconds, which
-was enough to drive the panel at the 4 s floor rather than once per poll — so
+was enough to drive the panel at the refresh floor rather than once per poll — so
 the bar now shows `Gok` / `Glo` with two satellites of hysteresis. Exact dBm
 and the exact satellite count are both on the diagnostics page, where numbers
 that precise are actually useful.
 
 Only a view change and the `f` key ask for a full refresh. Panning, zooming
 and recentring keep the same view and take the 651 ms partial rather than the
-1016 ms flash; a burst of them still trips the every-20th-partial promotion,
+1016 ms flash; a burst of them still trips the every-60th-partial promotion,
 so ghosting is cleared during the burst instead of on every press of it.
 
 **The feed is parsed straight off the socket.** A busy 250 nm query is a couple
@@ -515,39 +531,100 @@ fields the UI uses, the parse tree is allocated from PSRAM through a custom
 allocator so it cannot starve the Wi-Fi stack, and the response is never
 buffered whole.
 
+**Nothing is allowed to leak quietly.** The feed hands the PSRAM allocator a
+variable-size JSON arena to allocate and free about once a second against a
+local receiver, which is the pattern most likely to fragment a heap — and a
+heap that fragments does it over days, long after anyone is watching. So the
+serial log carries a heap line every `DIAG_HEAP_LOG_INTERVAL_MS`, and the
+diagnostics page carries `Free RAM` and `Max block` for both heaps. Free bytes
+alone cannot tell you the next parse is about to fail; the two figures drifting
+apart is what fragmentation looks like from outside.
+
 **Targets are merged, not replaced.** Aircraft drop in and out of a feed's
 coverage between polls; wholesale replacement makes the plot flicker. Snapshots
 merge into a fixed 96-slot store and entries retire after 90 s. Ageing also runs
 when the link is down, so a dropped connection decays the plot instead of
 freezing it.
 
-**The loop has a fast half and a slow half.** Draining the GNSS UART and
-answering the keyboard have to happen on a 10 ms cadence — the serial ring
-holds 67 ms of NMEA, and a keypress you cannot feel land is a keypress you
-press twice. Nothing else does. Reassembling the UI context calls into
-`esp_wifi` and `esp_netif` and hashing the scene walks all 96 slots, and at a
-hundred passes a second that was the largest single expense in the firmware,
-spent on changes no e-paper could show. It now runs once a second, or
-immediately when input or a completed poll makes it worth doing.
+When more than 96 targets are in range, which slot ends up where matters. A
+snapshot arrives in whatever order the feed serialises it, so keeping the first
+96 keeps an arbitrary 96 — and a radar that drops the traffic nearest you in
+favour of something at the far edge of the query has failed at the one thing it
+is for. A full store therefore gives a slot away only to a nearer target, and
+the rest of the snapshot is still merged rather than abandoned: those entries
+are mostly aircraft already being tracked, and skipping them would stop
+refreshing them until they aged out, freezing the plot in patches while the
+feed was perfectly healthy. The diagnostics page counts what was refused.
 
-The clock policy sits on top of that. The prebuilt Arduino libraries are
+**The loop has a fast half and a slow half.** Draining the GNSS UART and
+answering the keyboard have to happen on a 10 ms cadence — a keypress you
+cannot feel land is a keypress you press twice. Nothing else does. Reassembling
+the UI context calls into `esp_wifi` and `esp_netif` and hashing the scene walks
+all 96 slots, and at a hundred passes a second that was the largest single
+expense in the firmware, spent on changes no e-paper could show. It now runs
+twice a second, or immediately when input or a landed fetch makes it worth
+doing.
+
+**The fetch does not happen on that loop.** A poll against an aggregator is a
+socket, a TLS handshake and a couple of hundred kilobytes of JSON: 1.3–1.5 s
+during which the fast half above ran not at all. So it runs on a task of its
+own — same priority and same core as the Arduino loop, which is exactly where
+it already ran, so nothing about how it is scheduled changes; only the blocking
+does. The two share the core by round-robin while both are runnable, and the
+fetch spends nearly all of its time parked on a socket, not runnable at all.
+
+The handoff is a baton rather than a shared structure, which is what keeps the
+firmware free of locks. The task decodes into a staging store of its own and
+never touches the live tracker; `adsb::collect()` merges the two back on the
+loop task, and an atomic state word says which task owns the staging store at
+any moment. The staging store applies the same nearest-first eviction, so what
+crosses back is already the nearest 96 of the snapshot rather than the first 96
+of it.
+
+The other core is tempting and wrong. Its idle task is the one the task
+watchdog watches — the Arduino core exempts core 1 precisely because `loop()`
+hogs it — so a parse that ran long there would trip a reset that the same parse
+on this core does not. It is also where the Wi-Fi stack lives, at priorities far
+above this, feeding the very socket the fetch is waiting on.
+
+The clock policy sits on top of all that. The prebuilt Arduino libraries are
 compiled without `CONFIG_PM_ENABLE`, so there is no frequency scaling and no
 tickless idle to lean on — the core runs flat out at 240 MHz whatever it is
 doing. Two things genuinely are CPU-bound, the TLS fetch and drawing a frame,
-so `power::Boost` raises the clock around those and everything else runs at
-80 MHz. 80 is the floor that keeps the PLL-derived APB clock at 80 MHz, so the
-UART, I2C and SPI peripherals need no re-tuning across the change.
+so the clock is raised around those and everything else runs at 80 MHz. 80 is
+the floor that keeps the PLL-derived APB clock at 80 MHz, so the UART, I2C and
+SPI peripherals need no re-tuning across the change. Now that the fetch and the
+repaint can overlap, the claims are counted rather than set: the frequency
+rises on the first and falls on the last, so whichever finishes first cannot
+drop the clock out from under the other.
 
 ## Current footprint
 
 ```
-RAM:   21.3% (69,928 / 327,680 bytes)
-Flash: 15.7% (1,026,645 / 6,553,600 bytes)
-SPIFFS: 73 KB basemap + 801 KB aircraft database + 87 KB silhouettes, of 3.4 MB
+RAM:   24.5% (80,200 / 327,680 bytes) static, plus a 12 KB fetch task stack
+Flash: 24.3% (1,020,661 / 4,194,304 bytes) -- of a 4 MB app slot, not 6.4 MB
+SPIFFS: 73 KB basemap + 801 KB aircraft database + 87 KB silhouettes, of 11.9 MB
 PSRAM:  887 KB, holding both tables for the life of the run
 
 Pinning ADSB_PROVIDER_DEFAULT to LOCAL and deleting the aggregator branch of
-adsb::fetch() drops mbedtls and takes flash to 13.7% (898,381 bytes).
+adsb::fetchBlocking() drops mbedtls and takes about 120 KB off that.
+
+The stock 16 MB table is a dual-OTA layout: two 6.4 MB app slots, for a
+firmware that is 1 MB and an update path nothing here uses, leaving 3.4 MB for
+data. [partitions/single_app_16MB.csv](partitions/single_app_16MB.csv) keeps
+one 4 MB slot and gives the other 8.5 MB to the filesystem. `nvs` and `otadata`
+stay at their stock offsets so saved settings survive the switch; everything
+after them moves, so the filesystem needs one `pio run -t uploadfs` afterwards
+or the board comes up with no basemap and no database.
+
+The database is not bounded by that partition, though, and it is worth knowing
+which limit you are actually against: `aircraftdb::begin()` loads the whole
+file into PSRAM, and there are 8 MB of that shared with the basemap, the
+silhouettes and the JSON arena. Going worldwide needs on-demand seeking, not a
+bigger partition.
+
+Mounting 11.9 MB of SPIFFS costs about 220 ms more at boot than 3.4 MB did,
+measured on hardware.
 ```
 
 Measured on hardware, 651 ms partial / 1016 ms full panel refresh either way:
@@ -555,7 +632,13 @@ Measured on hardware, 651 ms partial / 1016 ms full panel refresh either way:
 | Feed | Fetch and parse |
 | --- | --- |
 | Aggregator over HTTPS, ~29 aircraft | 1.3–1.5 s |
-| Local receiver over HTTP, ~8 aircraft | **34 ms** |
+| Local receiver over HTTP, ~10 aircraft | **40–72 ms** |
+
+The local figure was 34 ms when the fetch had the core to itself. It now runs
+on its own task at the same priority as the loop, so it takes 40 ms when the
+loop happens to be parked in the panel's busy-wait and about 72 ms when the two
+are round-robining. Wall clock, not work: it is the same 34 ms of parsing,
+sharing a core with a UI that no longer has to wait for it.
 
 Nearly all of that difference is the TLS handshake rather than the payload. It
 is the single biggest change in the firmware's power profile: a poll that used
@@ -567,9 +650,18 @@ hardware, five aircraft in view at the default 40 nm range:
 
 | | Aggregator timings | Local timings |
 | --- | --- | --- |
-| Poll interval, median | 6.02 s | 1.51 s |
-| Partial refreshes | one per ~4 s | one per 2.36 s |
-| Panel duty cycle | ~13% | ~28% |
+| Poll interval, mean | 6.02 s | 1.18 s |
+| Partial refreshes | one per ~4 s | one per 2.35 s |
+| Panel duty cycle | ~13% | ~29% |
+
+The local interval is a mean rather than a median because it is no longer
+evenly spaced: polls arrive in pairs about 550 ms apart with a 1.8 s gap
+behind them, which is what a 1 s timer looks like when it can only be serviced
+between 651 ms repaints. It was 1.51 s while the fetch was synchronous.
+Scheduling the next poll from the request rather than from the result is what
+bought that back — measured from the result, a 1 s interval became 2.3 s,
+because the repaint sits between the two and the panel ended up setting the
+feed's cadence.
 
 The panel, not the network, is now the whole constraint. A partial refresh takes
 651 ms, so 1.5 Hz is the ceiling, and every refresh is 651 ms of powered panel
@@ -580,8 +672,10 @@ latency nobody is watching for.
 
 ## Not done yet
 
-- Runtime settings (Wi-Fi, home position, provider) are compile-time constants;
-  there is no on-device settings screen or NVS persistence.
+- Wi-Fi credentials and the home position are compile-time constants in
+  `secrets.h`, and there is no on-device settings screen. The handful of
+  choices that do persist are listed under "Settings that survive a reboot"
+  above.
 - No sort options in the list view — it is always nearest-first, and it does
   not drag-scroll (the visible window is driven by the selection).
 - No pinch-zoom. The CST328 reports multiple contacts, but at 0.7 s per refresh
