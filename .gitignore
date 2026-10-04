@@ -21,3 +21,10 @@ tools/.dbcache/
 
 # Re-downloaded on demand by tools/build_icons.py.
 tools/.iconcache/
+
+# Local SD-card staging contains Wi-Fi credentials, home position and logs.
+sdcard/
+
+# Generated Python bytecode.
+__pycache__/
+*.pyc

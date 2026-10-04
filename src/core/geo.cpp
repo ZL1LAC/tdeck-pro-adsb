@@ -8,7 +8,15 @@ namespace geo {
 namespace {
 constexpr double kDeg2Rad = M_PI / 180.0;
 constexpr double kRad2Deg = 180.0 / M_PI;
+
+uint8_t gDistanceUnits = UNITS_DISTANCE;
+uint8_t gSpeedUnits = UNITS_SPEED;
 }  // namespace
+
+void setDisplayUnits(uint8_t distance, uint8_t speed) {
+    gDistanceUnits = distance > 2 ? 0 : distance;
+    gSpeedUnits = speed > 2 ? 0 : speed;
+}
 
 double distanceNm(double lat1, double lon1, double lat2, double lon2) {
     const double phi1 = lat1 * kDeg2Rad;
@@ -88,43 +96,27 @@ const char *compassPoint(double bearing) {
 }
 
 float displayDistance(float nauticalMiles) {
-#if UNITS_DISTANCE == 1
-    return nauticalMiles * 1.15078f;
-#elif UNITS_DISTANCE == 2
-    return nauticalMiles * 1.852f;
-#else
+    if (gDistanceUnits == 1) return nauticalMiles * 1.15078f;
+    if (gDistanceUnits == 2) return nauticalMiles * 1.852f;
     return nauticalMiles;
-#endif
 }
 
 const char *distanceUnitLabel() {
-#if UNITS_DISTANCE == 1
-    return "mi";
-#elif UNITS_DISTANCE == 2
-    return "km";
-#else
+    if (gDistanceUnits == 1) return "mi";
+    if (gDistanceUnits == 2) return "km";
     return "nm";
-#endif
 }
 
 float displaySpeed(float knots) {
-#if UNITS_SPEED == 1
-    return knots * 1.15078f;
-#elif UNITS_SPEED == 2
-    return knots * 1.852f;
-#else
+    if (gSpeedUnits == 1) return knots * 1.15078f;
+    if (gSpeedUnits == 2) return knots * 1.852f;
     return knots;
-#endif
 }
 
 const char *speedUnitLabel() {
-#if UNITS_SPEED == 1
-    return "mph";
-#elif UNITS_SPEED == 2
-    return "kph";
-#else
+    if (gSpeedUnits == 1) return "mph";
+    if (gSpeedUnits == 2) return "kph";
     return "kt";
-#endif
 }
 
 }  // namespace geo

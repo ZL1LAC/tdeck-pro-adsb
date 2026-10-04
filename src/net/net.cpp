@@ -4,6 +4,7 @@
 #include <string.h>
 
 #include "config.h"
+#include "core/settings.h"
 
 namespace net {
 namespace {
@@ -16,21 +17,44 @@ uint32_t gBackoffMs = 2000;
 
 constexpr uint32_t kBackoffMaxMs = 60000;
 
+size_t networkCount() {
+    return kWifiNetworkCount + (settings::wifiOverride() ? 1 : 0);
+}
+
+void credentialsAt(size_t index, const char **ssid, const char **pass) {
+    if (settings::wifiOverride()) {
+        if (index == 0 || kWifiNetworkCount == 0) {
+            *ssid = settings::wifiSsid();
+            *pass = settings::wifiPass();
+            return;
+        }
+        --index;
+    }
+    const WifiCredential &cred = kWifiNetworks[index % kWifiNetworkCount];
+    *ssid = cred.ssid;
+    *pass = cred.pass;
+}
+
 void startAttempt(uint32_t now) {
-    if (kWifiNetworkCount == 0) {
+    const size_t n = networkCount();
+    if (n == 0) {
         // Nothing to associate with. Park with a retry far in the future
         // rather than returning straight back here on every poll() for the
         // life of the run -- and say so, because the alternative symptom is a
         // radio that silently never comes up.
-        log_e("wifi: secrets.h configures no networks");
+        log_e("wifi: no networks configured");
         gState = State::Failed;
         gRetryAtMs = now + kBackoffMaxMs;
         return;
     }
-    const WifiCredential &cred = kWifiNetworks[gCandidate % kWifiNetworkCount];
-    log_i("wifi: connecting to \"%s\"", cred.ssid);
-    WiFi.disconnect(true, true);
-    WiFi.begin(cred.ssid, (cred.pass && cred.pass[0]) ? cred.pass : nullptr);
+    const char *ssid = nullptr;
+    const char *pass = nullptr;
+    credentialsAt(gCandidate % n, &ssid, &pass);
+    log_i("wifi: connecting to \"%s\"", ssid ? ssid : "");
+    // wifioff/eraseap both stall for seconds and, with a wedged stack, never
+    // come back. Drop the association and try the next network.
+    WiFi.disconnect(false, false);
+    WiFi.begin(ssid, (pass && pass[0]) ? pass : nullptr);
     gAttemptStartedMs = now;
     gState = State::Connecting;
 }
@@ -41,8 +65,20 @@ void begin() {
     WiFi.mode(WIFI_STA);
     WiFi.setHostname(WIFI_HOSTNAME);
     WiFi.setAutoReconnect(true);
-    WiFi.setSleep(true);  // modem sleep: the poll interval is measured in seconds
+    // Modem sleep is what "locks up after sitting" looks like on this chip:
+    // the radio dozes between polls, and a later wake never returns to the
+    // Wi-Fi task. The loop then blocks on the first status/RSSI call.
+    WiFi.setSleep(false);
     startAttempt(millis());
+}
+
+void reconnect() {
+    gCandidate = 0;
+    gBackoffMs = 2000;
+    WiFi.disconnect(true, true);
+    gState = State::Failed;
+    gRetryAtMs = millis();
+    log_i("wifi: reconnect requested");
 }
 
 void poll() {
@@ -65,7 +101,7 @@ void poll() {
                 log_w("wifi: attempt timed out");
                 ++gCandidate;
                 // Back off only after every configured network has had a go.
-                if (gCandidate % kWifiNetworkCount == 0) {
+                if (gCandidate % networkCount() == 0) {
                     gState = State::Failed;
                     gRetryAtMs = now + gBackoffMs;
                     gBackoffMs = (gBackoffMs * 2 > kBackoffMaxMs) ? kBackoffMaxMs

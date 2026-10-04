@@ -1,8 +1,9 @@
 # T-Deck Pro ADS-B Tracker
 
-Live aircraft on the LilyGO **T-Deck Pro v1.0**: a north-up radar scope and a
-sortable traffic list on the 3.1" e-paper, driven from a public ADS-B feed over
-Wi-Fi.
+Live aircraft on the LilyGO **T-Deck Pro v1.0**: a cockpit-inspired, north-up
+traffic display and sortable traffic list on the 3.1" e-paper, driven from a
+public ADS-B feed over Wi-Fi. The persistent `SCOPE`, `LIST`, and `SETUP` tabs
+provide touch navigation; selected traffic gets a dedicated flight-data panel.
 
 ```
 +----------------------------------+
@@ -13,7 +14,7 @@ Wi-Fi.
 |         .---------.              |
 |       /   ~~~\   \               |   coastline, airports and runways
 |      |    ---+---   |            |   range rings, own position at the centre
-|       \      |    ~~/~           |   from the basemap in SPIFFS
+|       \      |    ~~/~           |   from the basemap on SD or in SPIFFS
 |         '---------'              |
 |       >BAW117  >EZY83AF          |   heading triangles + leader lines
 |        FL340    FL257            |
@@ -39,8 +40,10 @@ polls an aggregator instead. Its LoRa and 4G rails are held powered down.
 | Display | GDEQ031T10 e-paper, 240x320, UC8253 | ~1.1 s full refresh, ~0.7 s partial |
 | Keyboard | TCA8418 matrix controller @ 0x34 | 4x10, BlackBerry-style |
 | Touch | CST328 @ 0x1A | single finger, INT-driven; taps and drags |
+| ALS | LTR-553ALS @ 0x23 | lux on diagnostics; auto keypad backlight |
+| IMU | BHI260AP @ 0x28 | accel + coarse attitude on diagnostics; 1.8 V rail |
 | GNSS | u-blox MIA-M10Q on UART2 | optional; supplies the plot centre |
-| Fuel gauge | BQ27220 @ 0x55 | battery percentage |
+| Fuel gauge | BQ27220 @ 0x55 | percentage from cell voltage unless the gauge has been programmed for the 1400 mAh pack |
 | Charger | BQ25896 @ 0x6B | I2C watchdog disabled at boot |
 
 Pin assignments live in [board_pins.h](include/board_pins.h), transcribed from
@@ -89,9 +92,20 @@ LilyGO's `examples/factory/utilities.h` for hardware revision v1.0-241106.
 
    Defaults to New Zealand; pass `--bbox MINLAT MINLON MAXLAT MAXLON` for
    anywhere else. Skip it entirely and the radar just draws without a map.
+   The same `map.bin` can live on the SD card instead of (or as well as)
+   SPIFFS; the card wins when both are present. See [SD card](#sd-card).
 
-4. **First boot** shows a splash, then the radar. The status bar tells you what
-   is working; press `i` for the full diagnostics page.
+4. **First boot** shows a splash, then the traffic scope. Its instrument header
+   shows range, feed health and battery; press `i` for the full System page.
+
+## Display layout
+
+The monochrome UI uses a two-line status header and larger bottom tabs. The
+radar has 28-pixel zoom and follow controls, plus a selected-aircraft readout.
+The flight list uses larger callsigns and 40-pixel rows; tap a selected row
+again for details. The aircraft page separates altitude and speed from range,
+heading, climb, squawk and position. Setup and System use spaced rows with
+scrolling. Existing keyboard shortcuts remain available.
 
 ## Controls
 
@@ -102,6 +116,9 @@ Keyboard:
 | `w` `a` `s` `d` | Pan the plot (quarter of a screen per press) |
 | `z` `x` | Zoom out / in (5 – 250 nm) |
 | `c` | Recentre on your own position |
+| `b` | Follow the selected aircraft (plot stays locked on it; pan or `c` cancels) |
+| `o` | Settings page |
+| `h` | Cycle traffic filter (all / airborne / below FL100 / FL100+) |
 | `j` `k` | Next / previous target |
 | `t` | Toggle radar / list |
 | Enter | Open the detail page for the selected target |
@@ -109,29 +126,42 @@ Keyboard:
 | `r` | Poll the feed now |
 | `f` | Force a full e-paper refresh (clears ghosting) |
 | `g` | Take your own position from GNSS vs. the configured home |
-| `l` | Keyboard backlight |
+| `l` | Cycle keypad backlight (off / on / auto) |
 | `m` | Basemap on / off |
 | `p` | Swap feed: your own receiver / the aggregator |
 | `i` | Diagnostics page |
+| `v` | Dump the current frame to `/shots` on the SD card (PBM) |
 
 In the list and detail views there is nothing to pan, so `w`/`s` move the
-selection there instead. On the diagnostics page they scroll it: there are 28
-rows and the panel fits 21, so the page runs past the bottom of the screen and
-carries the same scroll indicator down its right edge that the list does.
+selection there instead. On the diagnostics page they scroll it. On the
+settings page they move the selected row; `a`/`d` (or Enter) change the value,
+and Enter on the Wi-Fi rows starts a text editor (sticky Shift / Sym only
+while typing). Drag the list, diagnostics or settings page to scroll it.
+
+The settings page (`o`) is where units, the traffic filter, list sort, poll
+pace, feed, map, map file, GNSS centring, backlight (off / on / auto),
+touch-axis flags, a captured home position, an override Wi-Fi network and
+the traffic log live. Those choices persist in NVS (the map file path and
+log switch as their own keys). `h` cycles the traffic filter without opening
+the page. `l` cycles the backlight the same way.
 
 Touch:
 
 - **Drag** anywhere on the radar to pan. The panel needs ~0.7 s per refresh, so
   the plot does not track your finger — it redraws once, on release.
-- **Tap** an aircraft to select it, a list row to select it, a selected row (or
-  the footer) to open its detail page, or the status bar to swap views.
-- **On the detail and diagnostics pages, a tap anywhere goes back** -- body,
-  status bar or footer. Those pages have nothing to select and no views to swap
-  between, and their footers say `U:back`.
-- **Drag the diagnostics page** to scroll it. A drag is already told apart from
-  a tap by the same threshold the radar uses, so the two do not collide.
+- **Tap** an aircraft to select it, its flight-data panel to open details, or a
+  list row to select it. Tap the selected list row again to open details.
+- **Use `SCOPE`, `LIST`, and `SETUP`** in the bottom navigation bar to change
+  primary pages. Detail and System pages have an explicit `BACK` control.
+- **On Setup, tap a category** (`TRAFFIC`, `DISPLAY`, `CONNECT`, or `DEVICE`),
+  then tap a row to change it. System diagnostics is under Device.
+- **Drag the list, diagnostics or settings page** to scroll it. A drag is
+  already told apart from a tap by the same threshold the radar uses, so the
+  two do not collide.
 - **`+` / `−` buttons** in the bottom corners zoom. Once panned, a crosshair
-  button appears top-left to recentre.
+  button appears top-left to recentre. With a target selected, a reticle
+  top-right follows that aircraft (`b` does the same). The readout says
+  `FOLLOWING` while it is on. `j` / `k` switch which aircraft is followed.
 
 Panning moves the plot, not you: ranges and bearings in the list, footer and
 detail page are always measured from your own position, which stays drawn as a
@@ -153,9 +183,9 @@ Your own receiver, or one of three key-less public aggregators. Pick with
 | Provider | Endpoint | Notes |
 | --- | --- | --- |
 | `LOCAL` (default) | `ADSB_LOCAL_URL` in secrets.h | Your own receiver. Plain HTTP, sub-second positions |
+| `AIRPLANES_LIVE` (remote) | `api.airplanes.live` | [API docs](https://airplanes.live/api-docs/). Asks for ≤ 1 request/second |
 | `ADSB_FI` | `opendata.adsb.fi` | Includes the `desc` type description |
 | `ADSB_LOL` | `api.adsb.lol` | No published rate limit |
-| `AIRPLANES_LIVE` | `api.airplanes.live` | Asks for ≤ 1 request/second |
 
 All four serve the same readsb-shaped JSON, so one parser and one field filter
 cover the lot; they differ only in URL layout and in whether the array is called
@@ -233,11 +263,53 @@ leaves the radar empty and fills it over ~30 s, while one GET of `aircraft.json`
 returns the receiver's whole accumulated picture. A persistent socket also wakes
 the Wi-Fi modem on every frame, where polling lets it idle in between.
 
+## SD card
+
+The slot shares SPI with the e-paper (CS on GPIO 48). A recursive mutex keeps
+the fetch task from talking to a seek-backed database in the middle of a 651 ms
+panel refresh. Mount happens after the splash, with the card optional: no card
+is not an error.
+
+The firmware opens generated blobs from the card first, then SPIFFS:
+
+| Path | Role |
+| --- | --- |
+| `/map.bin` | Default vector basemap |
+| `/maps/*.bin` | Extra regions; Settings → **Map file** cycles them |
+| `/aircraftdb.bin` | ICAO registry. Fits in PSRAM if ≤ 3 MB; otherwise seek-on-demand |
+| `/icons.bin` | Plan-view silhouettes |
+| `/wifi.txt` | Override network at boot (`ssid=` / `pass=`, or two lines). Not written to NVS |
+| `/home.txt` | Override home at boot (`lat=` / `lon=`, or two numbers). Not written to NVS |
+| `/logs/adsb.csv` | Traffic log when Settings → **Track log** is on |
+| `/shots/*.pbm` | 1-bit screenshots from the `v` key |
+
+Stage a folder and copy its contents to the card:
+
+```
+python tools/pack_sd.py          # writes ./sdcard/
+python tools/pack_sd.py --out E:/
+```
+
+`wifi.txt` / `home.txt` are for travel: drop the card in, boot, and the board
+associates with that network and centres on that home without touching the
+saved NVS values. Removing the card restores the compiled or previously saved
+ones on the next boot.
+
+A worldwide aircraft table (`python tools/build_db.py --blocks all`, about
+30 MB) belongs on the card. The detail page still resolves registration, type
+and description; the per-poll lookup that fills the list is skipped in seek
+mode so twenty SD probes are not paid for every target on every fetch. A
+regional table on the card loads into PSRAM exactly as SPIFFS did.
+
+The diagnostics page (`i`) shows the mount line, the last screenshot name, and
+whether the aircraft database is `rec` (in RAM) or `seek`.
+
 ## Basemap
 
 The radar draws over simplified vector coastlines, airports and runway
-centrelines, held in the SPIFFS partition as `/map.bin`. Three detail levels
-are stored and the plotted range picks one; `m` toggles the whole layer.
+centrelines, held as `/map.bin` on the SD card or in SPIFFS (the card wins).
+Three detail levels are stored and the plotted range picks one; `m` toggles
+the whole layer. Extra files in `/maps` on the card are picked from Settings.
 
 Vector rather than raster tiles, for three reasons. The panel is 1-bit, so
 dithered imagery turns to mud underneath the aircraft markers. Every frame
@@ -262,6 +334,7 @@ an OpenAir file yourself:
 ```
 python tools/build_map.py --airspace mapsrc/nz-airspace.txt
 pio run -t uploadfs
+# or: copy data/map.bin onto the SD card as /map.bin
 ```
 
 Keep the source file **out of `data/`** — that directory is the SPIFFS image, so
@@ -296,6 +369,12 @@ area blankets, which on a 240×320 mono panel bury the traffic completely:
 python tools/build_map.py --airspace mapsrc/nz-airspace.txt --airspace-classes all
 ```
 
+`AL`/`AH` are stored in `map.bin` (v2). The firmware then hides airspace the
+current traffic filter would not care about: below FL100 drops floors at
+FL100 and above; all/airborne still drop upper ATS from FL195; FL100+ hides
+surface airspace whose ceiling is below FL100. A v1 blob still loads and
+draws every outline, as before.
+
 Preview before you commit to it — see below.
 
 [`tools/verify_map.py`](tools/verify_map.py) reads the blob back with an
@@ -309,8 +388,9 @@ python tools/verify_map.py                                     # whole region
 python tools/verify_map.py --centre -36.5938 174.6944 --range 40
 ```
 
-The e-paper cannot be screenshotted, so that second form is the only way to see
-what a build will look like before flashing it. Use it to judge clutter.
+`verify_map.py` is the way to see what a build will look like before flashing
+it. On the device, `v` dumps the live frame to `/shots` on the SD card. Use the
+Python view to judge clutter.
 
 Only the Python standard library is used, so both scripts run wherever the
 toolchain does.
@@ -327,16 +407,20 @@ python tools/build_db.py --blocks C8,7C
 pio run -t uploadfs
 ```
 
-The full database is 615k records and 30 MB uncompressed, which neither fits a
-11.9 MB SPIFFS partition nor needs to — an aircraft has to be within radio range
-to appear on the plot, so only the ICAO address blocks you can actually hear are
-worth carrying.
+The full database is 615k records and 30 MB uncompressed, which neither fits
+SPIFFS nor the 8 MB of PSRAM. A regional slice is what you flash; the worldwide
+table belongs on the SD card:
 
-| Blocks | Records | On SPIFFS |
+```
+python tools/build_db.py --blocks all
+python tools/pack_sd.py
+```
+
+| Blocks | Records | Where |
 | --- | --- | --- |
-| `C8` — New Zealand and Fiji | 4,898 | 172 KB |
-| `C8,7C` — adding Australia | 22,807 | 801 KB |
-| `all` | 615,897 | will not fit |
+| `C8` — New Zealand and Fiji | 4,898 | 172 KB, SPIFFS or SD |
+| `C8,7C` — adding Australia | 22,807 | 801 KB, SPIFFS or SD |
+| `all` | 615,897 | ~30 MB, SD only (seek) |
 
 Each record carries the registration, the ICAO type designator, a plain-English
 description, the year built and the operator. The description is what the detail
@@ -397,8 +481,7 @@ tar1090 distinguishes them only once a wake category is known, and Doc 8643 does
 not carry one, so a short list of widebodies is corrected by hand and everything
 else takes the generic airliner.
 
-Since the e-paper cannot be screenshotted,
-[`tools/verify_icons.py`](tools/verify_icons.py) is the only way to see what was
+[`tools/verify_icons.py`](tools/verify_icons.py) is the way to see what was
 rasterised before flashing it. It re-reads the blob with an independent parser
 and draws the shapes as text:
 
@@ -466,10 +549,13 @@ less. If yours cold starts, lengthen `GNSS_SLEEP_MS`.
 
 ## Settings that survive a reboot
 
-Range, basemap on/off, GNSS centring, keyboard backlight and the chosen feed are
-kept in NVS. Everything else — the pan offset, the selection, the view — is
-deliberately not: restoring them would bring back a picture of traffic that flew
-away hours ago.
+Range, basemap on/off, GNSS centring, keyboard backlight (off / on / auto),
+the chosen feed,
+display units, traffic filter, list sort, poll pace, touch-axis flags, a
+captured home position and an optional Wi-Fi override are kept in NVS.
+Everything else — the pan offset, the selection, the view — is deliberately
+not: restoring them would bring back a picture of traffic that flew away hours
+ago.
 
 Writes are deferred five seconds and skipped when the bytes have not actually
 changed, so holding a zoom key through a dozen range steps costs one write
@@ -485,11 +571,14 @@ src/
     aircraftdb.{h,cpp}  ICAO -> registration/type/description, binary search
     settings.{h,cpp}    the handful of choices worth keeping in NVS
     tracker.{h,cpp}     merge snapshots, age out, sort by range, scene hash
+    filter.{h,cpp}      traffic and airspace altitude filter
     geo.{h,cpp}         haversine, bearing, flat-earth projection, units
   hw/
     power.{h,cpp}       I2C bus, rails, charger watchdog, fuel gauge
     keypad.{h,cpp}      TCA8418 matrix decode
     touch.{h,cpp}       CST328 press/release, interrupt-driven
+    als.{h,cpp}         LTR-553ALS ambient lux; auto keypad backlight
+    imu.{h,cpp}         BHI260AP accel (SensorLib + Bosch RAM firmware)
     gnss.{h,cpp}        MIA-M10Q with UART baud probing
   net/
     net.{h,cpp}         Wi-Fi association with backoff across several SSIDs
@@ -497,7 +586,7 @@ src/
   ui/
     display.{h,cpp}     GxEPD2 wrapper and the refresh policy
     icons.{h,cpp}       type designator -> plan-view silhouette
-    ui.{h,cpp}          views, input handling, layout
+    ui.{h,cpp}          views, input handling, layout, settings
 ```
 
 Five design points worth knowing:
@@ -601,10 +690,14 @@ drop the clock out from under the other.
 ## Current footprint
 
 ```
-RAM:   24.5% (80,200 / 327,680 bytes) static, plus a 12 KB fetch task stack
-Flash: 24.3% (1,020,661 / 4,194,304 bytes) -- of a 4 MB app slot, not 6.4 MB
+RAM:   25.6% (83,948 / 327,680 bytes) static, plus a 12 KB fetch task stack
+Flash: 29.0% (1,215,861 / 4,194,304 bytes) -- of a 4 MB app slot, not 6.4 MB
 SPIFFS: 73 KB basemap + 801 KB aircraft database + 87 KB silhouettes, of 11.9 MB
 PSRAM:  887 KB, holding both tables for the life of the run
+
+SensorLib's BHI260AP path and one Bosch RAM firmware image account for most of
+the jump from ~1.0 MB: the hub firmware is rewritten into the sensor on every
+boot and has to live in the app image to be uploaded.
 
 Pinning ADSB_PROVIDER_DEFAULT to LOCAL and deleting the aggregator branch of
 adsb::fetchBlocking() drops mbedtls and takes about 120 KB off that.
@@ -618,10 +711,10 @@ after them moves, so the filesystem needs one `pio run -t uploadfs` afterwards
 or the board comes up with no basemap and no database.
 
 The database is not bounded by that partition, though, and it is worth knowing
-which limit you are actually against: `aircraftdb::begin()` loads the whole
-file into PSRAM, and there are 8 MB of that shared with the basemap, the
-silhouettes and the JSON arena. Going worldwide needs on-demand seeking, not a
-bigger partition.
+which limit you are actually against: `aircraftdb::begin()` loads a regional
+file into PSRAM (capped at 3 MB), and there are 8 MB of that shared with the
+basemap, the silhouettes and the JSON arena. Going worldwide is seek-on-demand
+from the SD card, not a bigger partition.
 
 Mounting 11.9 MB of SPIFFS costs about 220 ms more at boot than 3.4 MB did,
 measured on hardware.
@@ -672,25 +765,27 @@ latency nobody is watching for.
 
 ## Not done yet
 
-- Wi-Fi credentials and the home position are compile-time constants in
-  `secrets.h`, and there is no on-device settings screen. The handful of
-  choices that do persist are listed under "Settings that survive a reboot"
-  above.
-- No sort options in the list view — it is always nearest-first, and it does
-  not drag-scroll (the visible window is driven by the selection).
+- Wi-Fi credentials and the home position have compile-time defaults in
+  `secrets.h`. The settings page can override both at runtime, and a
+  `wifi.txt` / `home.txt` on the SD card overrides them for that boot without
+  writing NVS. The local feed URL is the same story: Settings → Local URL, or
+  `/local.txt` on the card (`url=...`).
 - No pinch-zoom. The CST328 reports multiple contacts, but at 0.7 s per refresh
   a pinch gesture would be unusable; the corner buttons do the job instead.
-- Touch axis orientation is unverified on hardware. If taps land transposed or
-  mirrored — or dragging pans the wrong way — flip `kSwapXY` / `kMirrorX` /
-  `kMirrorY` in [touch.cpp](src/hw/touch.cpp).
+- Touch axis orientation is unmeasured on hardware, but the three flags are on
+  the settings page (`Swap XY` / `Mirror X` / `Mirror Y`) and the diagnostics
+  page shows the last tap so a wrong mapping is obvious.
 - No CPU sleep. The Arduino libraries ship without `CONFIG_PM_ENABLE`, so
   automatic light sleep and DFS are unavailable without rebuilding the
   framework, and manual `esp_light_sleep_start()` with the station associated
-  risks losing beacons. The CPU therefore never idles below 80 MHz, which is
-  the floor on what this can draw.
+  risks losing beacons. The CPU stays at 240 MHz: dropping to 80 MHz between
+  ticks wedged Wi-Fi after the radio had been idle. Wi-Fi modem sleep is off
+  for the same reason.
 - Airspace has no automatic data source; you have to supply an OpenAir file,
   and the only one indexed for New Zealand is several years stale.
-- The basemap has no roads or terrain, and no altitude filtering — an airspace
-  is drawn whether its floor is the surface or FL245, so `AH`/`AL` are parsed
-  and then thrown away.
-- Nothing uses the SD slot, the IMU, the light sensor, or the 4G modem.
+- The basemap has no roads or terrain.
+- Face-down idle hibernates the panel (and stretches the feed poll) when the
+  IMU reports face-down for five seconds. It defaults **off** until the IMU
+  axis labels are confirmed on Diagnostics; enable it from Settings. ALS auto
+  keypad backlight is on Settings (`off` / `on` / `auto`).
+- Nothing uses the 4G modem.

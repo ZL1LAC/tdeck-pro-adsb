@@ -46,7 +46,9 @@ void offsetNm(double lat0, double lon0, float eastNm, float northNm,
 // Compass point ("NNE", "SW", ...) for a bearing.
 const char *compassPoint(double bearing);
 
-// Unit conversion helpers, driven by the UNITS_* settings in config.h.
+// Unit conversion helpers. Defaults come from UNITS_* in config.h; the
+// settings page can change them at runtime via setDisplayUnits().
+void setDisplayUnits(uint8_t distance, uint8_t speed);
 float displayDistance(float nauticalMiles);
 const char *distanceUnitLabel();
 float displaySpeed(float knots);

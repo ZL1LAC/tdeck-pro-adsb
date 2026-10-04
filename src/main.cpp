@@ -10,17 +10,24 @@
 #include <WiFi.h>
 #include <esp_heap_caps.h>
 #include <math.h>
+#include <string.h>
+#include <time.h>
 
 #include "board_pins.h"
 #include "config.h"
 #include "core/aircraftdb.h"
+#include "core/aircraft.h"
+#include "core/assets.h"
 #include "core/geo.h"
 #include "core/settings.h"
 #include "core/tracker.h"
 #include "hw/clock.h"
 #include "hw/gnss.h"
 #include "hw/keypad.h"
+#include "hw/als.h"
+#include "hw/imu.h"
 #include "hw/power.h"
+#include "hw/sdcard.h"
 #include "hw/touch.h"
 #include "net/adsb_source.h"
 #include "net/net.h"
@@ -66,6 +73,43 @@ uint32_t gNextUiMs = 0;
 String gIpText;
 char gSsidText[33] = "";
 IPAddress gCachedIp;
+
+// Face-down idle: debounce the IMU orientation, then hibernate the panel and
+// stretch the feed poll. Any key/touch or leaving face-down wakes immediately.
+bool gFaceDownLatched = false;
+uint32_t gFaceDownSinceMs = 0;
+
+void wakeFromIdle() {
+    if (!gFaceDownLatched) return;
+    gFaceDownLatched = false;
+    gFaceDownSinceMs = 0;
+    display::invalidate(true);
+    power::refreshKeypadBacklight(settings::get().keypadBacklight);
+    gNextPollMs = millis();
+    log_i("idle: woke");
+}
+
+void updateFaceDownIdle() {
+    if (!settings::faceDownIdle() || !imu::present()) {
+        wakeFromIdle();
+        return;
+    }
+    const bool down = strcmp(imu::orientation(), "face down") == 0;
+    const uint32_t now = millis();
+    if (!down) {
+        gFaceDownSinceMs = 0;
+        wakeFromIdle();
+        return;
+    }
+    if (gFaceDownSinceMs == 0) gFaceDownSinceMs = now;
+    if (!gFaceDownLatched &&
+        static_cast<int32_t>(now - gFaceDownSinceMs) >=
+            static_cast<int32_t>(FACE_DOWN_IDLE_MS)) {
+        gFaceDownLatched = true;
+        display::hibernate();
+        log_i("idle: face down, hibernating panel");
+    }
+}
 
 // WiFi.localIP() is a field read off the netif; toString() and WiFi.SSID()
 // are the parts that allocate a String and call into esp_wifi. Comparing the
@@ -114,8 +158,8 @@ void ownPosition(double *lat, double *lon, bool *fromGnss) {
         *lon = gnss::longitude();
         *fromGnss = true;
     } else {
-        *lat = HOME_LATITUDE;
-        *lon = HOME_LONGITUDE;
+        *lat = settings::homeLatitude();
+        *lon = settings::homeLongitude();
         *fromGnss = false;
     }
 }
@@ -223,6 +267,43 @@ void logHeap() {
           static_cast<unsigned>(adsb::taskHeadroomBytes()));
 }
 
+void formatLogTime(char *dst, size_t dstLen) {
+    time_t now = time(nullptr);
+    struct tm tm;
+    if (wallclock::valid() && now > 1600000000 && localtime_r(&now, &tm)) {
+        snprintf(dst, dstLen, "%04u-%02u-%02uT%02u:%02u:%02u",
+                 static_cast<unsigned>(tm.tm_year + 1900) % 10000u,
+                 static_cast<unsigned>(tm.tm_mon + 1) % 100u,
+                 static_cast<unsigned>(tm.tm_mday) % 100u,
+                 static_cast<unsigned>(tm.tm_hour) % 100u,
+                 static_cast<unsigned>(tm.tm_min) % 100u,
+                 static_cast<unsigned>(tm.tm_sec) % 100u);
+        return;
+    }
+    snprintf(dst, dstLen, "m%lu", static_cast<unsigned long>(millis()));
+}
+
+void logTrafficSnapshot() {
+    if (!settings::logEnabled() || !sdcard::mounted()) return;
+    char when[24];
+    formatLogTime(when, sizeof(when));
+    for (size_t i = 0; i < gTracker.count(); ++i) {
+        const Aircraft &a = gTracker.at(i);
+        if (!a.hasPosition) continue;
+        char alt[12] = "";
+        if (a.altitudeKnown()) {
+            snprintf(alt, sizeof(alt), "%d", static_cast<int>(a.altitudeFt));
+        } else if (a.onGround()) {
+            snprintf(alt, sizeof(alt), "0");
+        }
+        char line[160];
+        snprintf(line, sizeof(line), "%s,%s,%s,%s,%.5f,%.5f,%s,%.0f,%.0f", when,
+                 a.hex, a.flight, a.reg, a.lat, a.lon, alt, a.groundSpeedKt,
+                 a.hasTrack ? a.trackDeg : 0.0f);
+        sdcard::logTraffic(line);
+    }
+}
+
 }  // namespace
 
 void setup() {
@@ -231,25 +312,36 @@ void setup() {
     Serial.println();
     Serial.println("T-Deck Pro ADS-B tracker starting");
 
-    // Before power::begin(), which sets the keyboard backlight, and before
-    // ui::begin() and the first poll, both of which read saved choices.
+    // Before power::begin() and ui::begin() and the first poll, all of which
+    // read saved choices. Backlight mode is applied after power::begin().
     settings::begin();
     adsb::setProvider(static_cast<AdsbProvider>(settings::get().provider));
 
     power::begin();
-    power::setKeypadBacklight(settings::get().keypadBacklight);
+    power::refreshKeypadBacklight(settings::get().keypadBacklight);
     display::begin();
     display::render(0, drawSplash);
 
     const bool keypadOk = keypad::begin();
     const bool touchOk = touch::begin();
-    Serial.printf("keypad %s, touch %s\n", keypadOk ? "ok" : "MISSING",
-                  touchOk ? "ok" : "MISSING");
+    const bool alsOk = als::begin();
+    const bool imuOk = imu::begin();
+    Serial.printf("keypad %s, touch %s, als %s, imu %s\n",
+                  keypadOk ? "ok" : "MISSING", touchOk ? "ok" : "MISSING",
+                  alsOk ? "ok" : "MISSING", imuOk ? "ok" : "MISSING");
+    als::poll();
+    power::refreshKeypadBacklight(settings::get().keypadBacklight);
+
+    // After display::begin() so SPI is already up, and before net::begin()
+    // so a wifi.txt on the card can win the association.
+    sdcard::begin();
+    sdcard::applyConfigFiles();
 
     gnss::begin();
     net::begin();
     adsb::begin();
     wallclock::begin();
+    assets::begin();
     basemap::begin();
     aircraftdb::begin();
     icons::begin();
@@ -258,10 +350,15 @@ void setup() {
     refreshBattery();
     gNextPollMs = millis();  // poll as soon as the link comes up
 
-    // Everything above ran at the 240 MHz boot frequency: release the claim
-    // boot holds, and from here on the clock is raised only around a feed
-    // fetch and a repaint.
+    // Boot holds one boost claim. The clock stays at 240 MHz either way; this
+    // just drops the counter so a later claim/release pair stays balanced.
     power::releaseBoost();
+
+    // A blocked loop() used to sit forever: Arduino only watches the idle
+    // task, and this firmware runs on the core whose idle task is exempt.
+    // Subscribing loop() means a deadlock reboots in about five seconds
+    // instead of leaving the last frame up until the battery dies.
+    enableLoopWDT();
 }
 
 void loop() {
@@ -277,12 +374,14 @@ void loop() {
     bool input = false;
     char key = 0;
     while ((key = keypad::poll()) != 0) {
+        wakeFromIdle();
         ui::handleKey(key);
         input = true;
     }
 
     touch::Event tap{};
     if (touch::poll(&tap)) {
+        wakeFromIdle();
         ui::handleTouch(tap);
         input = true;
     }
@@ -307,7 +406,35 @@ void loop() {
     wallclock::poll();
     refreshBattery();
     settings::poll();
+    als::poll();
+    imu::poll();
+    updateFaceDownIdle();
+    power::refreshKeypadBacklight(settings::get().keypadBacklight, gFaceDownLatched);
     logHeap();
+
+    // While face-down idle, skip the panel and stretch the feed. The panel is
+    // hibernated (deep sleep, last image held) rather than merely undrawn.
+    // Ageing still runs so a pocketed unit does not keep a frozen plot of
+    // stale traffic for the moment it wakes.
+    if (gFaceDownLatched && !input) {
+        if (static_cast<int32_t>(now - gNextAgeOutMs) >= 0) {
+            gNextAgeOutMs = now + kAgeOutIntervalMs;
+            double lat = 0.0, lon = 0.0;
+            bool fromGnss = false;
+            ownPosition(&lat, &lon, &fromGnss);
+            gTracker.finishUpdate(lat, lon, millis(), ui::selectedHex());
+        }
+        collectPoll();  // drain a landed fetch so the baton is not stuck
+        if (net::connected() && !adsb::busy() &&
+            static_cast<int32_t>(now - gNextPollMs) >= 0) {
+            // Push the deadline out rather than fetching a view we will not
+            // show. A wake resets gNextPollMs.
+            gNextPollMs = now + FACE_DOWN_IDLE_POLL_MS;
+        }
+        sdcard::poll();
+        delay(10);
+        return;
+    }
 
     // The only consumers of a GNSS position are the plot centre and, until it
     // is set, the clock. When neither wants one the module is powered down
@@ -339,6 +466,12 @@ void loop() {
     // one tick can start its successor on the same pass rather than the next.
     const bool fetched = collectPoll();
 
+    if (ui::consumePollPaceChange()) {
+        // Retarget from now so a switch to Slow is felt immediately rather
+        // than after whatever interval the previous pace had already queued.
+        gNextPollMs = now;
+    }
+
     if (connected && !adsb::busy() &&
         (manual || rangeGrew || moved ||
          static_cast<int32_t>(now - gNextPollMs) >= 0)) {
@@ -349,9 +482,11 @@ void loop() {
     // view centre. Recomputed after every fetch, and periodically regardless
     // so stale targets retire even when the link is down -- otherwise a
     // dropped Wi-Fi connection leaves a frozen plot that still looks live.
-    if (fetched || static_cast<int32_t>(now - gNextAgeOutMs) >= 0) {
+    const bool filterChanged = ui::consumeFilterChange();
+    if (fetched || filterChanged || static_cast<int32_t>(now - gNextAgeOutMs) >= 0) {
         gNextAgeOutMs = now + kAgeOutIntervalMs;
-        gTracker.finishUpdate(lat, lon, millis());
+        gTracker.finishUpdate(lat, lon, millis(), ui::selectedHex());
+        if (fetched) logTrafficSnapshot();
     }
 
     ui::Context ctx;
@@ -364,6 +499,8 @@ void loop() {
     ctx.gnssSatellites = gnss::satellites();
     ctx.gnssBaud = gnss::baud();
     ctx.wifiConnected = connected;
+    ctx.networkActivity = adsb::activity();
+    if (!connected) ctx.networkActivity = {};
     ctx.wifiRssi = connected ? net::rssi() : 0;
     ctx.wifiSsid = gSsidText;
     ctx.ipAddress = gIpText.c_str();
@@ -373,6 +510,7 @@ void loop() {
     ctx.batteryValid = gBatteryValid;
     ctx.batteryPercent = gBatteryPercent;
     ctx.batteryMilliVolts = gBatteryMilliVolts;
+    ctx.idle = gFaceDownLatched;
     ctx.keypadPresent = keypad::present();
     ctx.touchPresent = touch::present();
     ctx.lastFetchAgeMs =
@@ -381,6 +519,7 @@ void loop() {
 
     ui::setContext(ctx);
     ui::tick();
+    sdcard::poll();
 
     delay(10);
 }

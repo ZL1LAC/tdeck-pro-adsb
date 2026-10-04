@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Adafruit_GFX.h>
+#include <stddef.h>
 #include <stdint.h>
 
 namespace display {
@@ -26,7 +27,14 @@ bool render(uint32_t sceneHash, void (*draw)());
 // scene is unchanged. Use after a view change or on the user's request.
 void invalidate(bool forceFullRefresh = false);
 
-// Put the panel into deep sleep. It keeps showing the last image.
+// Put the panel into deep sleep. It keeps showing the last image. Controller
+// RAM is lost, so the next render() is forced to a full refresh.
 void hibernate();
+
+// Copy the 1-bit framebuffer (WIDTH/8 * HEIGHT bytes). False if dst is
+// too small. In the panel buffer, 1 bits are white; the caller inverts for PBM
+// (where 1 is black).
+bool copyFrame(uint8_t *dst, size_t len);
+size_t frameBytes();
 
 }  // namespace display

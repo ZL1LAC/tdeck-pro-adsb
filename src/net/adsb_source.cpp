@@ -14,7 +14,9 @@
 
 #include "config.h"
 #include "core/aircraftdb.h"
+#include "core/filter.h"
 #include "core/geo.h"
+#include "core/settings.h"
 
 namespace adsb {
 namespace {
@@ -25,6 +27,31 @@ constexpr uint16_t kMaxRadiusNm = 250;
 uint32_t gLastAttemptMs = 0;
 uint32_t gLastSuccessMs = 0;
 FetchStats gLastStats;
+
+std::atomic<bool> gUploadActivity{false};
+std::atomic<bool> gDownloadActivity{false};
+
+// Observe successful application bytes on both HTTP and HTTPS transports.
+// Latch bursts until the UI samples them, even if a fetch finishes in one tick.
+template <typename Transport>
+class ActivityClient : public Transport {
+   public:
+    size_t write(const uint8_t *buf, size_t size) override {
+        const size_t sent = Transport::write(buf, size);
+        if (sent) gUploadActivity.store(true, std::memory_order_relaxed);
+        return sent;
+    }
+    size_t write(uint8_t byte) override { return write(&byte, 1); }
+    int read(uint8_t *buf, size_t size) override {
+        const int received = Transport::read(buf, size);
+        if (received > 0) gDownloadActivity.store(true, std::memory_order_relaxed);
+        return received;
+    }
+    int read() override {
+        uint8_t byte;
+        return read(&byte, 1) == 1 ? byte : -1;
+    }
+};
 
 AdsbProvider gProvider = ADSB_PROVIDER_DEFAULT;
 
@@ -64,11 +91,14 @@ void buildUrl(char *out, size_t len, AdsbProvider p, double lat, double lon,
         case AdsbProvider::LOCAL:
             // A receiver's aircraft.json is a fixed path holding everything it
             // currently hears -- there is nothing to parameterise, and the
-            // radius is applied client-side after parsing instead.
+            // radius is applied client-side after parsing instead. A settings
+            // / SD override wins over the compiled secrets.h default.
             (void)lat;
             (void)lon;
             (void)radiusNm;
-            snprintf(out, len, "%s", ADSB_LOCAL_URL);
+            snprintf(out, len, "%s",
+                     settings::localUrlOverride() ? settings::localUrl()
+                                                 : ADSB_LOCAL_URL);
             break;
         case AdsbProvider::ADSB_FI:
             snprintf(out, len,
@@ -265,6 +295,24 @@ bool decodeAircraft(JsonObjectConst src, Aircraft *out) {
 
 AdsbProvider provider() { return gProvider; }
 
+Activity activity() {
+    // Called only from the loop task. Hold long enough for an e-paper refresh.
+    static uint32_t uploadMs = 0, downloadMs = 0;
+    static Activity visible;
+    const uint32_t now = millis();
+    if (gUploadActivity.exchange(false, std::memory_order_relaxed)) {
+        uploadMs = now;
+        visible.upload = true;
+    }
+    if (gDownloadActivity.exchange(false, std::memory_order_relaxed)) {
+        downloadMs = now;
+        visible.download = true;
+    }
+    if (now - uploadMs >= 1800) visible.upload = false;
+    if (now - downloadMs >= 1800) visible.download = false;
+    return visible;
+}
+
 bool isLocal() { return gProvider == AdsbProvider::LOCAL; }
 
 void setProvider(AdsbProvider p) {
@@ -281,7 +329,14 @@ void toggleProvider() {
 }
 
 uint32_t pollIntervalMs() {
-    return isLocal() ? ADSB_LOCAL_POLL_INTERVAL_MS : ADSB_REMOTE_POLL_INTERVAL_MS;
+    const uint32_t base =
+        isLocal() ? ADSB_LOCAL_POLL_INTERVAL_MS : ADSB_REMOTE_POLL_INTERVAL_MS;
+    switch (static_cast<PollPace>(settings::get().pollPace)) {
+        case PollPace::Normal: return base * 2;
+        case PollPace::Slow: return base * 5;
+        case PollPace::Fast:
+        default: return base;
+    }
 }
 
 uint32_t minIntervalMs() {
@@ -381,11 +436,20 @@ FetchStats runFetch(WiFiClient &client, const char *url, AdsbProvider p,
             continue;
         }
 
+        if (!filter::accept(parsed)) {
+            ++stats.filtered;
+            continue;
+        }
+
         // A local aircraft.json carries no "r" or "t" at all, and even an
         // aggregator leaves them out for aircraft it has not identified. The
-        // flashed table fills what it can; anything it misses stays empty and
-        // may still arrive from a later poll, so this never overwrites.
-        if (!parsed.reg[0] || !parsed.type[0]) {
+        // table fills what it can; anything it misses stays empty and may
+        // still arrive from a later poll, so this never overwrites. A
+        // seek-backed worldwide table is not consulted here: twenty SD
+        // probes per target would stall the e-paper's SPI bus. The detail
+        // page still looks them up one at a time.
+        if (aircraftdb::ramResident() &&
+            (!parsed.reg[0] || !parsed.type[0])) {
             char reg[sizeof(parsed.reg)] = {0};
             char type[sizeof(parsed.type)] = {0};
             if (aircraftdb::lookup(parsed.hex, reg, sizeof(reg), type,
@@ -436,11 +500,11 @@ FetchStats fetchBlocking(AdsbProvider p, double lat, double lon,
     // branches are compiled now that the choice is a runtime one, which is
     // what the TLS stack costs us in flash.
     if (p == AdsbProvider::LOCAL) {
-        WiFiClient client;
+        ActivityClient<WiFiClient> client;
         return runFetch(client, url, p, into, lat, lon, radiusNm, started);
     }
 
-    WiFiClientSecure client;
+    ActivityClient<WiFiClientSecure> client;
     // These are public, read-only, unauthenticated feeds and the board has no
     // way to refresh a pinned root as the providers rotate certificates. We
     // accept any certificate rather than ship a root that silently expires;

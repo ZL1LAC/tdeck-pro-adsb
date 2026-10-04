@@ -3,6 +3,7 @@
 #include <math.h>
 #include <string.h>
 
+#include "filter.h"
 #include "geo.h"
 
 namespace {
@@ -12,6 +13,23 @@ void mergeString(char *dst, size_t dstLen, const char *src) {
     if (!src || !src[0]) return;
     strncpy(dst, src, dstLen - 1);
     dst[dstLen - 1] = '\0';
+}
+
+void appendTrailPoint(Aircraft &a, double lat, double lon) {
+    if (a.trailCount > 0) {
+        const uint8_t last =
+            static_cast<uint8_t>((a.trailNext + AIRCRAFT_TRAIL_POINTS - 1) %
+                                 AIRCRAFT_TRAIL_POINTS);
+        const Aircraft::TrailPoint &p = a.trail[last];
+        if (geo::distanceNm(p.lat, p.lon, lat, lon) < AIRCRAFT_TRAIL_MIN_NM) {
+            return;
+        }
+    }
+
+    a.trail[a.trailNext].lat = lat;
+    a.trail[a.trailNext].lon = lon;
+    a.trailNext = static_cast<uint8_t>((a.trailNext + 1) % AIRCRAFT_TRAIL_POINTS);
+    if (a.trailCount < AIRCRAFT_TRAIL_POINTS) ++a.trailCount;
 }
 }  // namespace
 
@@ -73,6 +91,11 @@ bool Tracker::upsert(const Aircraft &incoming, uint32_t nowMs) {
         }
         items_[slot] = incoming;
         items_[slot].lastUpdateMs = nowMs;
+        items_[slot].trailCount = 0;
+        items_[slot].trailNext = 0;
+        if (incoming.hasPosition) {
+            appendTrailPoint(items_[slot], incoming.lat, incoming.lon);
+        }
         // finishUpdate() fills this in for everything at the end of the poll,
         // but the rest of this same snapshot has to be able to outbid the
         // entry before then -- and the zero Aircraft{} leaves here would read
@@ -92,6 +115,7 @@ bool Tracker::upsert(const Aircraft &incoming, uint32_t nowMs) {
     mergeString(dst.squawk, sizeof(dst.squawk), incoming.squawk);
 
     if (incoming.hasPosition) {
+        appendTrailPoint(dst, incoming.lat, incoming.lon);
         dst.lat = incoming.lat;
         dst.lon = incoming.lon;
         dst.hasPosition = true;
@@ -111,15 +135,22 @@ bool Tracker::upsert(const Aircraft &incoming, uint32_t nowMs) {
     return true;
 }
 
-void Tracker::finishUpdate(double centreLat, double centreLon, uint32_t nowMs) {
+void Tracker::finishUpdate(double centreLat, double centreLon, uint32_t nowMs,
+                           const char *keepHex) {
     centreLat_ = centreLat;
     centreLon_ = centreLon;
     haveCentre_ = true;
 
-    // Age out stale targets by compacting the array in place.
+    // Age out stale targets, and drop ones the current filter does not want,
+    // by compacting the array in place. The selected aircraft is kept even
+    // when it would now fail, so cycling the filter cannot yank the target
+    // you were looking at out from under you.
     size_t write = 0;
     for (size_t read = 0; read < count_; ++read) {
         if (nowMs - items_[read].lastUpdateMs > AIRCRAFT_STALE_MS) continue;
+        const bool keepSelected =
+            keepHex && keepHex[0] && strcmp(items_[read].hex, keepHex) == 0;
+        if (!keepSelected && !filter::accept(items_[read])) continue;
         if (write != read) items_[write] = items_[read];
         ++write;
     }

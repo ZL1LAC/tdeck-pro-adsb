@@ -32,6 +32,14 @@ struct Aircraft {
     uint32_t lastUpdateMs;  // millis() of the last feed update mentioning it.
     float seenPosSec;       // Feed-reported age of the position report.
 
+    struct TrailPoint {
+        double lat;
+        double lon;
+    };
+    TrailPoint trail[AIRCRAFT_TRAIL_POINTS];
+    uint8_t trailCount;
+    uint8_t trailNext;
+
     static constexpr int32_t kAltitudeUnknown = INT32_MIN;
     static constexpr int32_t kAltitudeGround = INT32_MIN + 1;
 

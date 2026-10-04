@@ -44,9 +44,10 @@ AIRPORTS_URL = 'https://davidmegginson.github.io/ourairports-data/airports.csv'
 RUNWAYS_URL = 'https://davidmegginson.github.io/ourairports-data/runways.csv'
 
 MAGIC = b'TDECKMAP'
-VERSION = 1
+VERSION = 2
 
 KIND_COAST, KIND_AIRSPACE, KIND_RUNWAY, KIND_AIRPORT = 0, 1, 2, 3
+INT16_MIN, INT16_MAX = -32768, 32767
 
 # One entry per detail level, coarsest last. `max_range_nm` is the largest
 # kRangeStepsNm value this level serves; `eps_nm` is the Douglas-Peucker
@@ -72,6 +73,45 @@ def fetch(url, name):
         f.write(r.read())
     print(f' {os.path.getsize(path)/1e6:.1f} MB')
     return path
+
+
+def parse_openair_alt(text):
+    """OpenAir AL/AH: SFC/GND, UNL, FLnnn, or a number of feet."""
+    if not text:
+        return None
+    t = text.strip().upper()
+    for token in ('AMSL', 'MSL', 'AGL', 'ASL'):
+        t = t.replace(token, ' ')
+    t = ' '.join(t.split())
+    if t in ('SFC', 'GND', 'GROUND', 'SURFACE'):
+        return 0
+    if t in ('UNL', 'UNLTD', 'UNLIMITED', 'UNLIM'):
+        return INT16_MAX
+    if t.startswith('FL'):
+        digits = ''.join(ch for ch in t[2:] if ch.isdigit())
+        return int(digits) * 100 if digits else None
+    num = ''
+    i = 0
+    while i < len(t) and (t[i].isdigit() or t[i] == '.'):
+        num += t[i]
+        i += 1
+    if not num:
+        return None
+    val = int(float(num))
+    rest = t[i:].strip()
+    if rest.startswith('FL'):
+        return val * 100
+    return val
+
+
+def clamp_alt(v, default):
+    if v is None:
+        return default
+    if v < INT16_MIN:
+        return INT16_MIN
+    if v > INT16_MAX:
+        return INT16_MAX
+    return v
 
 
 # ---------------------------------------------------------------- geometry ---
@@ -263,6 +303,8 @@ def load_airspace(path, bbox, classes):
     centre = None
     clockwise = True
     skipped = 0
+    floor_ft = None
+    ceil_ft = None
 
     def flush():
         nonlocal skipped
@@ -274,8 +316,13 @@ def load_airspace(path, bbox, classes):
         if len(pts) < 3:
             return
         ring = pts + [pts[0]]
+        rec = dict(name=f'{cls} {name}'.strip()[:20],
+                   floor_ft=clamp_alt(floor_ft, INT16_MIN),
+                   ceil_ft=clamp_alt(ceil_ft, INT16_MAX))
         for run in clip_runs(ring, bbox):
-            out.append(dict(name=f'{cls} {name}'.strip()[:20], points=run))
+            item = dict(rec)
+            item['points'] = run
+            out.append(item)
 
     with open(path, encoding='utf-8', errors='replace') as f:
         for raw in f:
@@ -289,8 +336,17 @@ def load_airspace(path, bbox, classes):
                 flush()
                 cls, name, pts = rest, '', []
                 centre, clockwise = None, True
+                floor_ft, ceil_ft = None, None
             elif tag == 'AN':
                 name = rest
+            elif tag == 'AL':
+                parsed = parse_openair_alt(rest)
+                if parsed is not None:
+                    floor_ft = parsed
+            elif tag == 'AH':
+                parsed = parse_openair_alt(rest)
+                if parsed is not None:
+                    ceil_ft = parsed
             elif tag == 'V':
                 key, _, val = rest.partition('=')
                 key, val = key.strip().upper(), val.strip()
@@ -342,12 +398,12 @@ def e7(v):
     return int(round(v * 1e7))
 
 
-def pack_feature(kind, name, points):
-    """int32 bbox, then counts, then 4-byte-aligned coords, then padded name.
+def pack_feature(kind, name, points, floor_ft=INT16_MIN, ceil_ft=INT16_MAX):
+    """int32 bbox, then counts, then floor/ceiling, then 4-byte-aligned coords.
 
     Laid out so every int32 the firmware reads is 4-byte aligned -- Xtensa
     traps unaligned 32-bit loads, and taking that on a per-vertex basis would
-    be ruinous.
+    be ruinous. v2 adds two int16 altitude fields after npts/kind/nameLen.
     """
     lats = [p[0] for p in points]
     lons = [p[1] for p in points]
@@ -356,6 +412,8 @@ def pack_feature(kind, name, points):
 
     return (struct.pack('<4i', e7(min(lats)), e7(min(lons)), e7(max(lats)), e7(max(lons)))
             + struct.pack('<HBB', len(points), kind, len(nb))
+            + struct.pack('<hh', clamp_alt(floor_ft, INT16_MIN),
+                          clamp_alt(ceil_ft, INT16_MAX))
             + b''.join(struct.pack('<ii', e7(p[0]), e7(p[1])) for p in points)
             + nb + b'\0' * pad)
 
@@ -372,7 +430,9 @@ def build_level(spec, coast, airports, airspace, lon_scale):
     for run in airspace:
         simp = simplify(run['points'], eps_deg, lon_scale)
         if len(simp) >= 2:
-            feats.append(pack_feature(KIND_AIRSPACE, run['name'], simp))
+            feats.append(pack_feature(KIND_AIRSPACE, run['name'], simp,
+                                      run.get('floor_ft', INT16_MIN),
+                                      run.get('ceil_ft', INT16_MAX)))
 
     for ap in airports:
         if ap['type'] not in spec['airport_types']:

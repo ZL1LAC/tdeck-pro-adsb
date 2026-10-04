@@ -7,6 +7,14 @@
 
 namespace adsb {
 
+struct Activity {
+    bool upload = false;
+    bool download = false;
+};
+
+// Sample from the loop task; recent HTTP(S) activity is held for 1.8 seconds.
+Activity activity();
+
 enum class Result : uint8_t {
     Ok,
     NotConnected,
@@ -19,7 +27,7 @@ struct FetchStats {
     int httpStatus = 0;
     uint16_t received = 0;   // aircraft objects in the response
     uint16_t stored = 0;     // how many made it into the tracker
-    uint16_t filtered = 0;   // dropped as beyond the query radius (local feed)
+    uint16_t filtered = 0;   // beyond query radius, or rejected by the traffic filter
     uint16_t dropped = 0;    // refused: store full, and no nearer than its contents
     uint32_t durationMs = 0;
     uint32_t bytes = 0;

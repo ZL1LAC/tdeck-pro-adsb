@@ -15,6 +15,8 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 KINDS = {0: 'coast', 1: 'airspace', 2: 'runway', 3: 'airport'}
 GLYPH = {0: '#', 1: ':', 2: '=', 3: 'o'}
+INT16_MIN, INT16_MAX = -32768, 32767
+KIND_AIRSPACE = 1
 
 
 def read_blob(path):
@@ -30,12 +32,18 @@ def read_blob(path):
     return data, version, bbox, dirs
 
 
-def read_features(data, d):
+def read_features(data, d, version):
     pos, end, feats = d['offset'], d['offset'] + d['length'], []
+    hdr = 24 if version >= 2 else 20
     while pos < end:
         mnla, mnlo, mxla, mxlo = struct.unpack_from('<4i', data, pos)
         npts, kind, namelen = struct.unpack_from('<HBB', data, pos + 16)
-        cpos = pos + 20
+        if version >= 2:
+            floor_ft, ceil_ft = struct.unpack_from('<hh', data, pos + 20)
+            cpos = pos + 24
+        else:
+            floor_ft, ceil_ft = INT16_MIN, INT16_MAX
+            cpos = pos + 20
         pts = [(la / 1e7, lo / 1e7) for la, lo in
                struct.iter_unpack('<ii', data[cpos:cpos + 8 * npts])]
         npos = cpos + 8 * npts
@@ -44,10 +52,29 @@ def read_features(data, d):
         if pos % 4:
             sys.exit(f'feature at {pos} lost 4-byte alignment')
         feats.append(dict(kind=kind, name=name, points=pts,
+                          floor_ft=floor_ft, ceil_ft=ceil_ft,
                           bbox=(mnla / 1e7, mnlo / 1e7, mxla / 1e7, mxlo / 1e7)))
     if pos != end:
         sys.exit(f'level overran its length: {pos} != {end}')
     return feats
+
+
+def airspace_visible(floor_ft, ceil_ft, traffic='all'):
+    """Match filter::airspaceVisible() for the named traffic preset."""
+    if traffic == 'low':
+        max_floor = 10000
+        min_ceil = 0
+    elif traffic == 'high':
+        max_floor = INT16_MAX
+        min_ceil = 10000
+    else:
+        max_floor = 19500
+        min_ceil = 0
+    if max_floor != INT16_MAX and floor_ft != INT16_MIN and floor_ft >= max_floor:
+        return False
+    if min_ceil > 0 and ceil_ft not in (INT16_MAX, INT16_MIN) and ceil_ft < min_ceil:
+        return False
+    return True
 
 
 def plot(feats, bbox, w=78, h=40):
@@ -147,6 +174,9 @@ def main():
                     help='render the radar view the device would draw here')
     ap.add_argument('--range', type=float, default=40.0,
                     help='plotted range in nm for --centre (default 40)')
+    ap.add_argument('--traffic', choices=('all', 'air', 'low', 'high'),
+                    default='all',
+                    help='airspace altitude skip, matching the device filter')
     args = ap.parse_args()
 
     data, version, bbox, dirs = read_blob(args.file)
@@ -154,7 +184,7 @@ def main():
     print(f'bbox lat {bbox[0]}..{bbox[2]}  lon {bbox[1]}..{bbox[3]}\n')
 
     for i, d in enumerate(dirs):
-        feats = read_features(data, d)
+        feats = read_features(data, d, version)
         assert len(feats) == d['count'], (len(feats), d['count'])
         tally = {}
         for f in feats:
@@ -167,16 +197,25 @@ def main():
         # Same rule as basemap.cpp levelFor().
         show = next((i for i, d in enumerate(dirs)
                      if args.range <= d['max_range_nm']), len(dirs) - 1)
-        feats = read_features(data, dirs[show])
+        feats = read_features(data, dirs[show], version)
+        skipped = 0
+        kept = []
+        for f in feats:
+            if f['kind'] == KIND_AIRSPACE and not airspace_visible(
+                    f['floor_ft'], f['ceil_ft'], args.traffic):
+                skipped += 1
+                continue
+            kept.append(f)
         print(f'\nradar view: {args.range:.0f} nm around '
               f'{args.centre[0]:.4f}, {args.centre[1]:.4f}  -> level {show}')
+        print(f'airspace altitude skip ({args.traffic}): {skipped} runs hidden')
         print('(# coast, o airport, = runway, : airspace, + own position)')
-        scope(feats, args.centre[0], args.centre[1], args.range)
+        scope(kept, args.centre[0], args.centre[1], args.range)
         return
 
     show = args.level if args.level is not None else len(dirs) - 1
     print(f'\nlevel {show}  (# coast, o airport, = runway, : airspace)')
-    plot(read_features(data, dirs[show]), bbox)
+    plot(read_features(data, dirs[show], version), bbox)
 
 
 if __name__ == '__main__':

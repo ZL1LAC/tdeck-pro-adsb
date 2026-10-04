@@ -2,13 +2,17 @@
 
 #include <Adafruit_GFX.h>
 #include <Arduino.h>
-#include <SPIFFS.h>
+#include <FS.h>
 #include <math.h>
+#include <stdint.h>
 #include <string.h>
 
 #include "config.h"
+#include "core/assets.h"
+#include "core/filter.h"
 #include "core/geo.h"
 #include "display.h"
+#include "hw/spibus.h"
 
 namespace basemap {
 namespace {
@@ -16,11 +20,13 @@ namespace {
 constexpr uint16_t BLACK = 0x0000;
 
 const char kMagic[8] = {'T', 'D', 'E', 'C', 'K', 'M', 'A', 'P'};
-constexpr uint16_t kVersion = 1;
+constexpr uint16_t kVersionMin = 1;
+constexpr uint16_t kVersionMax = 2;
 constexpr uint8_t kMaxLevels = 4;
 constexpr uint8_t kHeaderLen = 32;
 constexpr uint8_t kDirEntryLen = 12;
-constexpr uint8_t kFeatureHeaderLen = 20;
+constexpr uint8_t kFeatureHeaderV1 = 20;
+constexpr uint8_t kFeatureHeaderV2 = 24;
 
 enum Kind : uint8_t { kCoast = 0, kAirspace = 1, kRunway = 2, kAirport = 3 };
 
@@ -40,6 +46,7 @@ struct LevelDir {
 bool gReady = false;
 LevelDir gLevels[kMaxLevels];
 uint16_t gLevelCount = 0;
+uint16_t gFileVersion = 1;
 
 int gLoaded = -1;  // level currently in gBuf, or -1
 uint8_t *gBuf = nullptr;
@@ -62,6 +69,16 @@ inline uint16_t rd16(const uint8_t *p) {
     return v;
 }
 
+inline int16_t rd16s(const uint8_t *p) {
+    int16_t v;
+    memcpy(&v, p, sizeof(v));
+    return v;
+}
+
+uint8_t featureHeaderLen() {
+    return gFileVersion >= 2 ? kFeatureHeaderV2 : kFeatureHeaderV1;
+}
+
 int levelFor(uint16_t rangeNm) {
     for (uint16_t i = 0; i < gLevelCount; ++i) {
         if (rangeNm <= gLevels[i].maxRangeNm) return static_cast<int>(i);
@@ -72,7 +89,8 @@ int levelFor(uint16_t rangeNm) {
 bool loadLevel(int idx) {
     if (idx == gLoaded) return true;
 
-    File f = SPIFFS.open(MAP_FILE, "r");
+    spibus::Lock lock;
+    fs::File f = assets::openMap();
     if (!f) return false;
 
     const uint32_t len = gLevels[idx].length;
@@ -181,17 +199,14 @@ bool clipToCircle(float *x0, float *y0, float *x1, float *y1, float cx, float cy
 
 bool begin() {
     gReady = false;
+    gLoaded = -1;
+    gLevelCount = 0;
 
-    if (!SPIFFS.begin(false)) {
-        snprintf(gStatus, sizeof(gStatus), "no filesystem");
-        log_w("basemap: SPIFFS mount failed");
-        return false;
-    }
-
-    File f = SPIFFS.open(MAP_FILE, "r");
+    spibus::Lock lock;
+    fs::File f = assets::openMap();
     if (!f) {
-        snprintf(gStatus, sizeof(gStatus), "no %s", MAP_FILE);
-        log_w("basemap: %s missing; run 'pio run -t uploadfs'", MAP_FILE);
+        snprintf(gStatus, sizeof(gStatus), "no map");
+        log_w("basemap: no map.bin on SD or SPIFFS");
         return false;
     }
 
@@ -205,11 +220,13 @@ bool begin() {
 
     const uint16_t version = rd16(hdr + 8);
     const uint16_t levels = rd16(hdr + 10);
-    if (version != kVersion || levels == 0 || levels > kMaxLevels) {
+    if (version < kVersionMin || version > kVersionMax || levels == 0 ||
+        levels > kMaxLevels) {
         snprintf(gStatus, sizeof(gStatus), "v%u/%u levels", version, levels);
         f.close();
         return false;
     }
+    gFileVersion = version;
 
     uint8_t dir[kDirEntryLen * kMaxLevels];
     if (f.read(dir, kDirEntryLen * levels) != kDirEntryLen * levels) {
@@ -229,10 +246,12 @@ bool begin() {
     gLevelCount = levels;
     gReady = true;
 
-    snprintf(gStatus, sizeof(gStatus), "%u levels", levels);
-    log_i("basemap: %u levels from %s", levels, MAP_FILE);
+    snprintf(gStatus, sizeof(gStatus), "%s %u lv", assets::mapSource(), levels);
+    log_i("basemap: %u levels from %s", levels, assets::mapSource());
     return true;
 }
+
+bool reload() { return begin(); }
 
 bool available() { return gReady; }
 
@@ -264,10 +283,11 @@ void draw(double centreLat, double centreLon, float pixelsPerNm, int16_t cx,
     // the map the most expensive thing on screen.
     const geo::Projector projector(centreLat, centreLon);
 
+    const uint8_t featHdr = featureHeaderLen();
     const uint8_t *p = gBuf;
     const uint8_t *const end = gBuf + gDataLen;
 
-    while (p + kFeatureHeaderLen <= end) {
+    while (p + featHdr <= end) {
         const int32_t bMinLat = rd32(p);
         const int32_t bMinLon = rd32(p + 4);
         const int32_t bMaxLat = rd32(p + 8);
@@ -275,11 +295,18 @@ void draw(double centreLat, double centreLon, float pixelsPerNm, int16_t cx,
         const uint16_t npts = rd16(p + 16);
         const uint8_t kind = p[18];
         const uint8_t nameLen = p[19];
+        const int16_t floorFt = (gFileVersion >= 2) ? rd16s(p + 20) : INT16_MIN;
+        const int16_t ceilFt = (gFileVersion >= 2) ? rd16s(p + 22) : INT16_MAX;
 
-        const uint8_t *coords = p + kFeatureHeaderLen;
+        const uint8_t *coords = p + featHdr;
         const uint8_t *name = coords + 8u * npts;
         const uint8_t *next = name + nameLen + ((4u - (nameLen & 3u)) & 3u);
         if (next > end || npts == 0) break;  // truncated or corrupt: stop
+
+        if (kind == kAirspace && !filter::airspaceVisible(floorFt, ceilFt)) {
+            p = next;
+            continue;
+        }
 
         if (bMaxLat < vMinLat || bMinLat > vMaxLat || bMaxLon < vMinLon ||
             bMinLon > vMaxLon) {

@@ -14,6 +14,18 @@ struct Event {
     int16_t y;
 };
 
+// Axis flags applied after the controller's raw report, so a panel that
+// comes up transposed or mirrored can be fixed from the settings page
+// without a rebuild. Same order as the old compile-time constants: swap,
+// then mirror, then clamp.
+void setAxisFlags(bool swapXY, bool mirrorX, bool mirrorY);
+
+struct LastTap {
+    int16_t x = -1;
+    int16_t y = -1;
+};
+const LastTap &lastTap();
+
 // CST328 capacitive controller. Returns false if the panel does not answer.
 bool begin();
 bool present();

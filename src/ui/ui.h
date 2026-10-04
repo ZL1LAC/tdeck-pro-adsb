@@ -8,7 +8,7 @@
 
 namespace ui {
 
-enum class View : uint8_t { Radar, List, Detail, Status };
+enum class View : uint8_t { Radar, List, Detail, Status, Settings };
 
 // Everything the views need that lives outside the UI. main.cpp refreshes this
 // once per loop; the UI never reaches into the drivers itself.
@@ -27,6 +27,7 @@ struct Context {
     uint32_t gnssBaud = 0;
 
     bool wifiConnected = false;
+    adsb::Activity networkActivity;
     int wifiRssi = 0;
     const char *wifiSsid = "";
     const char *ipAddress = "";
@@ -34,6 +35,9 @@ struct Context {
     bool batteryValid = false;
     uint8_t batteryPercent = 0;
     uint16_t batteryMilliVolts = 0;
+
+    // True while face-down idle has parked the panel / slowed the feed.
+    bool idle = false;
 
     // Local time, already resolved by hw/clock. Invalid until either SNTP or
     // the GNSS has set the system clock.
@@ -75,5 +79,16 @@ void panOffsetNm(float *eastNm, float *northNm);
 // Current query radius, so main.cpp can keep the feed request in step with
 // what is actually being displayed.
 uint16_t rangeNm();
+
+// ICAO hex of the selected target, or empty. main.cpp passes this to
+// Tracker::finishUpdate so a filter change cannot drop what you have open.
+const char *selectedHex();
+
+// True once when the traffic filter changed and the live store should be
+// compacted before the next poll.
+bool consumeFilterChange();
+
+// True once when the poll pace changed and main should retarget gNextPollMs.
+bool consumePollPaceChange();
 
 }  // namespace ui

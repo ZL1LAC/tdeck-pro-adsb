@@ -15,10 +15,13 @@ constexpr uint16_t kRegTouchData = 0xD000;  // 7-byte first-finger report
 constexpr uint16_t kRegNormalMode = 0xD109;
 constexpr uint8_t kReportTail = 0xAB;
 
-// Set these if your panel reports mirrored or transposed coordinates.
-constexpr bool kSwapXY = false;
-constexpr bool kMirrorX = false;
-constexpr bool kMirrorY = false;
+// Runtime, not compile-time: the settings page can flip them without a
+// rebuild when a panel reports mirrored or transposed coordinates.
+bool gSwapXY = false;
+bool gMirrorX = false;
+bool gMirrorY = false;
+
+LastTap gLastTap;
 
 // Only used while a contact is live -- when idle we wait for the INT line.
 constexpr uint32_t kPollIntervalMs = 20;
@@ -94,13 +97,13 @@ bool readContact(int16_t *x, int16_t *y) {
     int16_t py = static_cast<int16_t>((static_cast<uint16_t>(buf[2]) << 4) |
                                       (buf[3] & 0x0F));
 
-    if (kSwapXY) {
+    if (gSwapXY) {
         const int16_t t = px;
         px = py;
         py = t;
     }
-    if (kMirrorX) px = (EPD_WIDTH - 1) - px;
-    if (kMirrorY) py = (EPD_HEIGHT - 1) - py;
+    if (gMirrorX) px = (EPD_WIDTH - 1) - px;
+    if (gMirrorY) py = (EPD_HEIGHT - 1) - py;
 
     clampToScreen(&px, &py);
     *x = px;
@@ -109,6 +112,14 @@ bool readContact(int16_t *x, int16_t *y) {
 }
 
 }  // namespace
+
+void setAxisFlags(bool swapXY, bool mirrorX, bool mirrorY) {
+    gSwapXY = swapXY;
+    gMirrorX = mirrorX;
+    gMirrorY = mirrorY;
+}
+
+const LastTap &lastTap() { return gLastTap; }
 
 bool begin() {
     pinMode(BOARD_TOUCH_INT, INPUT_PULLUP);
@@ -160,6 +171,8 @@ bool poll(Event *out) {
             out->x = x;
             out->y = y;
         }
+        gLastTap.x = x;
+        gLastTap.y = y;
         log_d("touch down: %d,%d", x, y);
         return true;
     }
@@ -171,6 +184,8 @@ bool poll(Event *out) {
             out->x = gLastX;
             out->y = gLastY;
         }
+        gLastTap.x = gLastX;
+        gLastTap.y = gLastY;
         log_d("touch up: %d,%d", gLastX, gLastY);
         return true;
     }

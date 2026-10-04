@@ -2,12 +2,14 @@
 
 #include <Adafruit_GFX.h>
 #include <Arduino.h>
-#include <SPIFFS.h>
+#include <FS.h>
 #include <esp_heap_caps.h>
 #include <string.h>
 
 #include "config.h"
+#include "core/assets.h"
 #include "display.h"
+#include "hw/spibus.h"
 
 namespace icons {
 namespace {
@@ -85,22 +87,22 @@ const uint8_t *shapeEntry(int32_t index) {
 }  // namespace
 
 bool begin() {
-    if (!SPIFFS.begin(false)) {
-        snprintf(gStatus, sizeof(gStatus), "no SPIFFS");
-        return false;
-    }
-
-    File f = SPIFFS.open(ICON_FILE, "r");
+    fs::File f = assets::openIcons();
     if (!f) {
         snprintf(gStatus, sizeof(gStatus), "no %s", ICON_FILE);
         return false;
     }
 
     uint8_t header[kHeaderLen];
-    if (f.read(header, sizeof(header)) != static_cast<int>(sizeof(header))) {
-        snprintf(gStatus, sizeof(gStatus), "header truncated");
-        f.close();
-        return false;
+    size_t size = 0;
+    {
+        spibus::Lock lock;
+        if (f.read(header, sizeof(header)) != static_cast<int>(sizeof(header))) {
+            snprintf(gStatus, sizeof(gStatus), "header truncated");
+            f.close();
+            return false;
+        }
+        size = static_cast<size_t>(f.size());
     }
 
     const uint16_t version = rd16(header + 8);
@@ -116,7 +118,6 @@ bool begin() {
         return false;
     }
 
-    const size_t size = static_cast<size_t>(f.size());
     if (shapeCount == 0 || mapCount == 0 || bitmapOff > size ||
         shapeOff + static_cast<size_t>(shapeCount) * kShapeEntryLen > size ||
         mapOff + static_cast<size_t>(mapCount) * kMapEntryLen > size) {
@@ -134,15 +135,18 @@ bool begin() {
         return false;
     }
 
-    f.seek(0);
-    if (f.read(gBuf, size) != static_cast<int>(size)) {
-        snprintf(gStatus, sizeof(gStatus), "read failed");
-        free(gBuf);
-        gBuf = nullptr;
+    {
+        spibus::Lock lock;
+        f.seek(0);
+        if (f.read(gBuf, size) != static_cast<int>(size)) {
+            snprintf(gStatus, sizeof(gStatus), "read failed");
+            free(gBuf);
+            gBuf = nullptr;
+            f.close();
+            return false;
+        }
         f.close();
-        return false;
     }
-    f.close();
 
     gShapeCount = shapeCount;
     gMapCount = mapCount;
@@ -150,12 +154,12 @@ bool begin() {
     gMapOff = mapOff;
     gBitmapOff = bitmapOff;
 
-    snprintf(gStatus, sizeof(gStatus), "%u types %uk",
+    snprintf(gStatus, sizeof(gStatus), "%s %u t %uk", assets::iconSource(),
              static_cast<unsigned>(gMapCount),
              static_cast<unsigned>(size / 1024));
-    log_i("icons: %u shapes, %u designators, %u KB in PSRAM",
+    log_i("icons: %u shapes, %u designators, %u KB in PSRAM (%s)",
           static_cast<unsigned>(gShapeCount), static_cast<unsigned>(gMapCount),
-          static_cast<unsigned>(size / 1024));
+          static_cast<unsigned>(size / 1024), assets::iconSource());
     return true;
 }
 

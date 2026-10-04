@@ -20,9 +20,11 @@ class Tracker {
     // is no nearer than the farthest one already held -- see evictFor().
     bool upsert(const Aircraft &incoming, uint32_t nowMs);
 
-    // Drop entries older than AIRCRAFT_STALE_MS, recompute range/bearing
-    // against the given centre, and sort nearest-first.
-    void finishUpdate(double centreLat, double centreLon, uint32_t nowMs);
+    // Drop entries older than AIRCRAFT_STALE_MS, drop those the traffic
+    // filter rejects (unless `keepHex` still names them), recompute
+    // range/bearing against the given centre, and sort nearest-first.
+    void finishUpdate(double centreLat, double centreLon, uint32_t nowMs,
+                      const char *keepHex = nullptr);
 
     // Where upsert() should measure from when it has to choose which of two
     // targets to keep. finishUpdate() sets this as a side effect; a store that

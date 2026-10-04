@@ -8,6 +8,10 @@ enum class State : uint8_t { Idle, Connecting, Connected, Failed };
 
 void begin();
 
+// Drop the current association and try again from the first candidate
+// (NVS override, then the compiled secrets.h list).
+void reconnect();
+
 // Drives connection and reconnection. Call from the main loop; never blocks
 // for more than a few milliseconds.
 void poll();

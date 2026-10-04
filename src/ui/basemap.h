@@ -7,20 +7,23 @@
 // Named "basemap" rather than "map" so nothing collides with Arduino's global
 // map() or with std::map.
 //
-// The data is built offline by tools/build_map.py and flashed into the SPIFFS
-// partition as /map.bin: simplified polylines at three detail levels, chosen by
-// the plotted range. Vector rather than raster tiles because the panel is
-// 1-bit -- dithered imagery turns to mud under the aircraft markers -- and
-// because every frame redraws from scratch, so per-frame decode cost would be
-// paid over and over.
+// The data is built offline by tools/build_map.py and lives on the SD card
+// (preferred) or in the SPIFFS partition as /map.bin: simplified polylines at
+// three detail levels, chosen by the plotted range. Vector rather than raster
+// tiles because the panel is 1-bit -- dithered imagery turns to mud under the
+// aircraft markers -- and because every frame redraws from scratch, so
+// per-frame decode cost would be paid over and over.
 //
 // Drawing costs no extra e-paper refreshes: the map is a pure function of the
 // plot centre and the range, both of which already feed the scene hash.
 namespace basemap {
 
-// Mounts SPIFFS and reads the file header. Safe to call when no map is
-// flashed; available() then stays false and draw() does nothing.
+// Reads the file header. Safe to call when no map is present;
+// available() then stays false and draw() does nothing.
 bool begin();
+
+// Re-read the header after the selected map file changes.
+bool reload();
 
 bool available();
 

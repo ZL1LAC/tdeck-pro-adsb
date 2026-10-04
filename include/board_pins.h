@@ -14,6 +14,14 @@
 #define ADDR_GAUGE_BQ27220  0x55
 #define ADDR_PMU_BQ25896    0x6B
 
+// Ambient light (LTR-553ALS) and IMU (BHI260AP) interrupt lines. Unused by
+// the firmware today -- both sensors are polled -- but kept with the rest of
+// the pin map so a later IRQ-driven path does not have to dig through the
+// vendor header again.
+#define BOARD_ALS_INT 16
+#define BOARD_IMU_INT 21
+#define BOARD_IMU_RST (-1)
+
 // --------------------------------------------------------------- SPI bus ----
 // Shared by the e-paper panel, the SD slot and the SX1262.
 #define BOARD_SPI_SCK  36

@@ -1,23 +1,30 @@
 #include "ui.h"
 
 #include <Arduino.h>
+#include <ctype.h>
 #include <esp_heap_caps.h>
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
 
 #include "basemap.h"
 #include "board_pins.h"
 #include "config.h"
+#include "core/filter.h"
 #include "core/geo.h"
 #include "core/aircraftdb.h"
 #include "core/settings.h"
 #include "display.h"
 #include "icons.h"
+#include "hw/als.h"
 #include "hw/clock.h"
 #include "hw/gnss.h"
+#include "hw/imu.h"
 #include "hw/keypad.h"
 #include "hw/power.h"
+#include "hw/sdcard.h"
+#include "net/net.h"
 
 namespace ui {
 namespace {
@@ -30,49 +37,46 @@ constexpr uint16_t WHITE = 0xFFFF;
 constexpr int16_t SCREEN_W = EPD_WIDTH;
 constexpr int16_t SCREEN_H = EPD_HEIGHT;
 
-constexpr int16_t STATUS_H = 14;
-constexpr int16_t FOOTER_H = 21;
-constexpr int16_t CONTENT_Y = STATUS_H + 1;
+constexpr int16_t STATUS_H = 32;
+constexpr int16_t FOOTER_H = 28;
+constexpr int16_t CONTENT_Y = STATUS_H;
 constexpr int16_t FOOTER_Y = SCREEN_H - FOOTER_H;
-constexpr int16_t CONTENT_H = FOOTER_Y - 1 - CONTENT_Y;
+constexpr int16_t CONTENT_H = FOOTER_Y - CONTENT_Y;
+
+// The scope is a complete instrument face: header, plot, target readout, nav.
+constexpr int16_t SCOPE_Y = STATUS_H;
+constexpr int16_t SCOPE_H = 200;
+constexpr int16_t READOUT_Y = SCOPE_Y + SCOPE_H;
+constexpr int16_t READOUT_H = 60;
+constexpr int16_t NAV_Y = READOUT_Y + READOUT_H;
 
 constexpr int16_t CHAR_W = 6;   // built-in GFX font, size 1
 constexpr int16_t CHAR_H = 8;
-constexpr int16_t ROW_H = 11;   // list rows
-
-// --------------------------------------------- status bar layout -----------
-// The bar is packed to the pixel: four zones separated by 1 px rules. The two
-// right-hand fields are anchored to the right edge rather than to a fixed x,
-// so a 3- vs 4-character battery percentage cannot shift anything else. Worst
-// case ("RDR 463km", "96ac", "100%") lands exactly on SCREEN_W - 2.
-constexpr int16_t BAR_TEXT_Y = 3;
-constexpr int16_t BAR_DIV_1 = 59;     // context | feed
-constexpr int16_t BAR_DIV_2 = 113;    // feed | radios
-constexpr int16_t BAR_DIV_3 = 161;    // radios | power
-constexpr int16_t BAR_CTX_X = 2;      // "RDR 40nm" / "DETAIL" / "DIAG"
-constexpr int16_t BAR_COUNT_X = 63;   // "12ac"
-constexpr int16_t BAR_AGE_X = 91;     // "OK" / "30s" / "2m"
-constexpr int16_t BAR_WIFI_X = 117;   // 4 bars, 2 px wide on a 3 px pitch
-constexpr int16_t BAR_GNSS_X = 133;   // "G8*"
-constexpr int16_t BAR_CLOCK_X = 165;  // "23:45"
-constexpr int16_t BAR_BATT_X = 199;   // battery glyph, 13 px wide
+constexpr int16_t ROW_H = 40;   // readable two-line traffic cards
+constexpr int16_t STATUS_ROW_H = 16;
+constexpr int16_t SETTINGS_TOP = CONTENT_Y + 28;
+constexpr int16_t SETTINGS_ROW_H = 36;
+constexpr int SETTINGS_VISIBLE = (FOOTER_Y - SETTINGS_TOP) / SETTINGS_ROW_H;
+constexpr int16_t SETTINGS_BOTTOM = SETTINGS_TOP + SETTINGS_VISIBLE * SETTINGS_ROW_H;
 
 constexpr int16_t RADAR_CX = SCREEN_W / 2;
-constexpr int16_t RADAR_CY = CONTENT_Y + CONTENT_H / 2;
-constexpr int16_t RADAR_R = 110;
+constexpr int16_t RADAR_CY = SCOPE_Y + SCOPE_H / 2;
+constexpr int16_t RADAR_R = 88;
 
 // Labelling every target turns the plot into mush. Nearest few plus whatever
 // is selected is what you actually want to read.
-constexpr int kMaxLabels = 10;
+constexpr int kMaxLabels = 5;
 constexpr int kTapRadiusPx = 18;
 
 // On-screen zoom / recentre buttons, clear of the outer range ring.
-constexpr int16_t BTN = 20;
-constexpr int16_t BTN_Y = FOOTER_Y - 5 - BTN;
+constexpr int16_t BTN = 28;
+constexpr int16_t BTN_Y = SCOPE_Y + SCOPE_H - BTN - 5;
 constexpr int16_t BTN_MINUS_X = 4;
 constexpr int16_t BTN_PLUS_X = SCREEN_W - 4 - BTN;
 constexpr int16_t BTN_HOME_X = 4;
 constexpr int16_t BTN_HOME_Y = CONTENT_Y + 15;
+constexpr int16_t BTN_FOLLOW_X = SCREEN_W - 4 - BTN;
+constexpr int16_t BTN_FOLLOW_Y = CONTENT_Y + 15;
 
 // A drag shorter than this is a tap, not a pan.
 constexpr int kDragThresholdPx = 10;
@@ -90,23 +94,105 @@ size_t gRangeIndex = RANGE_DEFAULT_INDEX;  // overwritten by begin() from NVS
 // Plot centre as an offset from our own position, in nautical miles.
 float gPanEastNm = 0.0f;
 float gPanNorthNm = 0.0f;
+// When set, each tick rewrites the pan so the selected aircraft stays at the
+// plot centre. Not saved: it only means something while that target is live.
+bool gFollowAircraft = false;
 
 // Where the current touch started, so a release can tell a tap from a drag.
 int16_t gTouchDownX = 0;
 int16_t gTouchDownY = 0;
 int gListTop = 0;
+uint8_t gListOrder[MAX_AIRCRAFT];
+int gListCount = 0;
+bool gListFollowSelection = true;
 
-// The diagnostics page has more rows than the panel has lines -- 28 against
-// the 21 that fit -- so it scrolls. Kept as a row index rather than pixels so
-// a row can never be half drawn. gStatusRows is what the last draw counted,
-// which is what the scroll clamps against: several rows are conditional, so
-// the total is not a constant anybody can write down here.
+int gSettingsTop = 0;
+int gSettingsRow = 0;
+int gSettingsRows = 0;
+uint8_t gSettingsCategory = 0;
+
+bool gFilterChanged = false;
+bool gPollPaceChanged = false;
+
+enum class EditField : uint8_t { None, Ssid, Pass, LocalUrl };
+EditField gEditField = EditField::None;
+char gEditBuf[settings::kLocalUrlMax + 1] = {0};
+bool gEditShift = false;
+bool gEditSym = false;
+
+enum class SetRow : uint8_t {
+    Distance = 0,
+    Speed,
+    Traffic,
+    Sort,
+    Poll,
+    Feed,
+    LocalUrl,
+    Map,
+    MapFile,
+    Gnss,
+    Backlight,
+    Idle,
+    SwapXY,
+    MirrorX,
+    MirrorY,
+    Home,
+    WifiSsid,
+    WifiPass,
+    TrackLog,
+    System,
+    Count
+};
+
+uint8_t settingCategory(SetRow row) {
+    switch (row) {
+        case SetRow::Distance:
+        case SetRow::Speed:
+        case SetRow::Traffic:
+        case SetRow::Sort:
+        case SetRow::Poll:
+        case SetRow::TrackLog: return 0;  // traffic
+        case SetRow::Map:
+        case SetRow::MapFile: return 1;  // display
+        case SetRow::Feed:
+        case SetRow::LocalUrl:
+        case SetRow::Gnss:
+        case SetRow::Home:
+        case SetRow::WifiSsid:
+        case SetRow::WifiPass: return 2;  // connection
+        default: return 3;  // device
+    }
+}
+
+int firstSettingInCategory(uint8_t category) {
+    for (int i = 0; i < static_cast<int>(SetRow::Count); ++i) {
+        if (settingCategory(static_cast<SetRow>(i)) == category) return i;
+    }
+    return 0;
+}
+
+int settingAtCategoryIndex(uint8_t category, int wanted) {
+    int found = 0;
+    for (int i = 0; i < static_cast<int>(SetRow::Count); ++i) {
+        if (settingCategory(static_cast<SetRow>(i)) != category) continue;
+        if (found++ == wanted) return i;
+    }
+    return firstSettingInCategory(category);
+}
+
+// The diagnostics page has more rows than the panel has lines, so it scrolls.
+// Kept as a row index rather than pixels so a row can never be half drawn.
+// gStatusRows is what the last draw counted, which is what the scroll clamps
+// against: several rows are conditional, so the total is not a constant
+// anybody can write down here.
 int gStatusTop = 0;
 int gStatusRows = 0;
 
 bool gRefreshRequested = false;
 bool gCentreOnGnss = GNSS_CENTRE_BY_DEFAULT;
 bool gMapEnabled = MAP_ENABLED_BY_DEFAULT;
+
+void setView(View v);
 
 // Mirrors the handful of UI choices worth surviving a reboot into the
 // persisted set. The write itself is deferred and coalesced by
@@ -116,7 +202,6 @@ void persist() {
     s.rangeIndex = static_cast<uint8_t>(gRangeIndex);
     s.mapEnabled = gMapEnabled;
     s.centreOnGnss = gCentreOnGnss;
-    s.keypadBacklight = power::keypadBacklight();
     s.provider = static_cast<uint8_t>(adsb::provider());
     settings::markDirty();
 }
@@ -134,9 +219,36 @@ void textAt(int16_t x, int16_t y, const char *s, uint16_t colour = BLACK,
     d.print(s);
 }
 
+// Bound fixed-width text to its allocated area; editors retain the tail.
+size_t textBounded(int16_t x, int16_t y, int16_t width, const char *s,
+                   uint16_t colour = BLACK, uint8_t size = 1, bool tail = false) {
+    char shown[SCREEN_W / CHAR_W + 1];
+    const size_t capacity = width > 0 ? width / (CHAR_W * size) : 0;
+    size_t count = strlen(s);
+    if (count > capacity) {
+        if (tail) s += count - capacity;
+        count = capacity;
+    }
+    if (count >= sizeof(shown)) count = sizeof(shown) - 1;
+    memcpy(shown, s, count);
+    shown[count] = '\0';
+    textAt(x, y, shown, colour, size);
+    return count;
+}
+
 void textRight(int16_t xRight, int16_t y, const char *s,
                uint16_t colour = BLACK) {
     textAt(static_cast<int16_t>(xRight - strlen(s) * CHAR_W), y, s, colour);
+}
+
+void labelAt(int16_t x, int16_t y, const char *s, uint16_t colour = BLACK) {
+    char upper[24];
+    size_t i = 0;
+    for (; s[i] && i + 1 < sizeof(upper); ++i) {
+        upper[i] = static_cast<char>(toupper(static_cast<unsigned char>(s[i])));
+    }
+    upper[i] = '\0';
+    textAt(x, y, upper, colour);
 }
 
 int selectionIndex() {
@@ -154,6 +266,7 @@ void selectIndex(int idx) {
     if (!gCtx.tracker || idx < 0 ||
         idx >= static_cast<int>(gCtx.tracker->count())) {
         gSelectedHex[0] = '\0';
+        gFollowAircraft = false;
         return;
     }
     strncpy(gSelectedHex, gCtx.tracker->at(static_cast<size_t>(idx)).hex,
@@ -161,18 +274,76 @@ void selectIndex(int idx) {
     gSelectedHex[sizeof(gSelectedHex) - 1] = '\0';
 }
 
+void clearSelection() {
+    if (!gSelectedHex[0] && !gFollowAircraft) return;
+    gSelectedHex[0] = '\0';
+    gFollowAircraft = false;
+    display::invalidate();
+}
+
+bool listBefore(uint8_t ia, uint8_t ib) {
+    const Aircraft &a = gCtx.tracker->at(ia);
+    const Aircraft &b = gCtx.tracker->at(ib);
+    switch (static_cast<ListSort>(settings::get().listSort)) {
+        case ListSort::Alt: {
+            auto key = [](const Aircraft &x) -> int32_t {
+                if (!x.altitudeKnown()) return INT32_MIN / 2;
+                if (x.onGround()) return INT32_MIN / 2 + 1;
+                return x.altitudeFt;
+            };
+            return key(a) > key(b);
+        }
+        case ListSort::Speed:
+            return a.groundSpeedKt > b.groundSpeedKt;
+        case ListSort::Callsign:
+            return strcasecmp(a.label(), b.label()) < 0;
+        case ListSort::Range:
+        default:
+            return a.distanceNm < b.distanceNm;
+    }
+}
+
+void rebuildListOrder() {
+    gListCount = gCtx.tracker ? static_cast<int>(gCtx.tracker->count()) : 0;
+    for (int i = 0; i < gListCount; ++i) {
+        gListOrder[i] = static_cast<uint8_t>(i);
+    }
+    if (gListCount < 2) return;
+    if (static_cast<ListSort>(settings::get().listSort) == ListSort::Range) {
+        return;  // tracker is already nearest-first
+    }
+    for (int i = 1; i < gListCount; ++i) {
+        const uint8_t key = gListOrder[i];
+        int j = i;
+        while (j > 0 && listBefore(key, gListOrder[j - 1])) {
+            gListOrder[j] = gListOrder[j - 1];
+            --j;
+        }
+        gListOrder[j] = key;
+    }
+}
+
+int visualIndexOfStore(int storeIdx) {
+    for (int i = 0; i < gListCount; ++i) {
+        if (gListOrder[i] == storeIdx) return i;
+    }
+    return storeIdx;
+}
+
 void moveSelection(int delta) {
     if (!gCtx.tracker || gCtx.tracker->count() == 0) return;
-    const int n = static_cast<int>(gCtx.tracker->count());
-    int idx = selectionIndex();
-    if (idx < 0) {
-        idx = (delta >= 0) ? 0 : n - 1;
+    gListFollowSelection = true;
+    rebuildListOrder();
+    const int n = gListCount;
+    int vis = visualIndexOfStore(selectionIndex());
+    if (vis < 0 || selectionIndex() < 0) {
+        vis = (delta >= 0) ? 0 : n - 1;
     } else {
-        idx += delta;
-        if (idx < 0) idx = n - 1;
-        if (idx >= n) idx = 0;
+        vis += delta;
+        if (vis < 0) vis = n - 1;
+        if (vis >= n) vis = 0;
     }
-    selectIndex(idx);
+    selectIndex(gListOrder[vis]);
 }
 
 uint16_t currentRangeNm() { return kRangeStepsNm[gRangeIndex]; }
@@ -291,6 +462,8 @@ float panStepNm() { return currentRangeNm() * 0.25f; }
 // keys still hit the every-20th-partial promotion, so ghosting is cleared
 // during a burst rather than on every press of it.
 void panByNm(float eastNm, float northNm) {
+    // A hand pan means the user wants the plot, not the aircraft.
+    gFollowAircraft = false;
     gPanEastNm += eastNm;
     gPanNorthNm += northNm;
     clampPan();
@@ -312,9 +485,46 @@ void zoomOut() {
 }
 
 void recentre() {
-    if (!isPanned()) return;
+    const bool wasFollowing = gFollowAircraft;
+    gFollowAircraft = false;
+    if (!isPanned()) {
+        if (wasFollowing) display::invalidate();
+        return;
+    }
     gPanEastNm = 0.0f;
     gPanNorthNm = 0.0f;
+    display::invalidate();
+}
+
+const geo::Projector &ownProjector();
+
+// Park the plot centre on the selected aircraft. The next tick keeps it
+// there; this only snaps immediately so the key feels like it landed.
+void updateFollow() {
+    if (!gFollowAircraft) return;
+    const Aircraft *a = selected();
+    if (!a) {
+        gFollowAircraft = false;
+        return;
+    }
+    if (!a->hasPosition) return;
+    float east = 0.0f, north = 0.0f;
+    ownProjector().project(a->lat, a->lon, &east, &north);
+    gPanEastNm = east;
+    gPanNorthNm = north;
+    clampPan();
+}
+
+void toggleFollow() {
+    if (gFollowAircraft) {
+        gFollowAircraft = false;
+        display::invalidate();
+        return;
+    }
+    const Aircraft *a = selected();
+    if (!a || !a->hasPosition) return;
+    gFollowAircraft = true;
+    updateFollow();
     display::invalidate();
 }
 
@@ -374,9 +584,23 @@ bool radarPosition(const Aircraft &a, int16_t *sx, int16_t *sy) {
     return true;
 }
 
-// ---------------------------------------------------------- status bar -----
-void drawVDivider(int16_t x) { g().drawFastVLine(x, 2, 10, BLACK); }
+bool radarLatLonPosition(double lat, double lon, int16_t *sx, int16_t *sy) {
+    float east = 0.0f, north = 0.0f;
+    ownProjector().project(lat, lon, &east, &north);
+    east -= gPanEastNm;
+    north -= gPanNorthNm;
 
+    const float scale = pixelsPerNm();
+    const float px = east * scale;
+    const float py = -north * scale;
+    if (px * px + py * py > static_cast<float>(RADAR_R) * RADAR_R) return false;
+
+    *sx = static_cast<int16_t>(lroundf(RADAR_CX + px));
+    *sy = static_cast<int16_t>(lroundf(RADAR_CY + py));
+    return true;
+}
+
+// ---------------------------------------------------------- status bar -----
 // A 13x8 cell: an 11x7 body, a 2x3 terminal nub, and a fill bar scaled to
 // charge. Left hollow when the gauge is silent, which reads as "unknown"
 // rather than as "flat".
@@ -393,124 +617,126 @@ void drawBatteryGlyph(int16_t x, int16_t y, bool valid, uint8_t pct) {
     }
 }
 
+const char *viewTitle() {
+    switch (gView) {
+        case View::Radar: return "RADAR";
+        case View::List: return "FLIGHTS";
+        case View::Detail: return "AIRCRAFT";
+        case View::Status: return "SYSTEM";
+        case View::Settings: return "SETUP";
+    }
+    return "TRAFFIC";
+}
+
+// Each arrow has an inverse background while transferring; idle arrows remain
+// visible so the pair reads as a network indicator even between polls.
+void drawActivityArrow(int16_t x, bool up, bool active) {
+    Adafruit_GFX &d = g();
+    if (active) d.fillRect(x, 5, 8, 14, BLACK);
+    const uint16_t ink = active ? WHITE : BLACK;
+    const int16_t cx = x + 3;
+    const int16_t tip = up ? 8 : 15;
+    const int16_t wing = up ? 11 : 12;
+    d.drawFastVLine(cx, 8, 8, ink);
+    d.drawLine(cx - 2, wing, cx, tip, ink);
+    d.drawLine(cx + 2, wing, cx, tip, ink);
+}
+
 void drawStatusBar() {
     Adafruit_GFX &d = g();
     char buf[24];
+    textBounded(6, 3, 174, viewTitle(), BLACK, 2);
 
-    // -- context. Which view you are on, plus the plotted range wherever that
-    // means something: the list used to give you no way to tell what radius
-    // you were looking at.
-    switch (gView) {
-        case View::Radar:
-        case View::List:
-            snprintf(buf, sizeof(buf), "%s %u%s", gView == View::Radar ? "RDR" : "LST",
-                     static_cast<unsigned>(geo::displayDistance(currentRangeNm())),
-                     geo::distanceUnitLabel());
-            break;
-        case View::Detail:
-            snprintf(buf, sizeof(buf), "DETAIL");
-            break;
-        case View::Status:
-            snprintf(buf, sizeof(buf), "DIAG");
-            break;
+    if (gView == View::Radar || gView == View::List) {
+        snprintf(buf, sizeof(buf), "R %u%s",
+                 static_cast<unsigned>(geo::displayDistance(currentRangeNm())),
+                 geo::distanceUnitLabel());
+        textAt(6, 22, buf);
+    } else {
+        textAt(6, 22, gCtx.wifiConnected ? "WI-FI CONNECTED" : "WI-FI OFFLINE");
     }
-    textAt(BAR_CTX_X, BAR_TEXT_Y, buf);
-    drawVDivider(BAR_DIV_1);
 
-    // -- feed. How much traffic we are holding, and how healthy the poll loop
-    // is.
-    const size_t total = gCtx.tracker ? gCtx.tracker->count() : 0;
-    snprintf(buf, sizeof(buf), "%uac", static_cast<unsigned>(total));
-    textAt(BAR_COUNT_X, BAR_TEXT_Y, buf);
-
+    drawActivityArrow(166, true, gCtx.networkActivity.upload);
+    drawActivityArrow(175, false, gCtx.networkActivity.download);
     formatFeedAge(buf, sizeof(buf));
-    textAt(BAR_AGE_X, BAR_TEXT_Y, buf);
-    drawVDivider(BAR_DIV_2);
-
-    // -- radios.
-    if (gCtx.wifiConnected) {
-        const int bars = wifiBars(gCtx.wifiRssi);
-        for (int i = 0; i < 4; ++i) {
-            const int16_t h = static_cast<int16_t>(2 + 2 * i);
-            const int16_t bx = static_cast<int16_t>(BAR_WIFI_X + i * 3);
-            if (i < bars) {
-                d.fillRect(bx, static_cast<int16_t>(11 - h), 2, h, BLACK);
-            } else {
-                d.drawFastHLine(bx, 10, 2, BLACK);  // empty bar: base tick only
-            }
-        }
-    } else {
-        textAt(BAR_WIFI_X, BAR_TEXT_Y, "--");
-    }
-
-    if (!gCtx.gnssEnabled) {
-        snprintf(buf, sizeof(buf), "G--");
-    } else if (gCtx.gnssFix) {
-        const int quality = gnssQuality(true, gCtx.gnssSatellites);
-        snprintf(buf, sizeof(buf), "G%s%s", quality >= 2 ? "ok" : "lo",
-                 gCentreOnGnss ? "*" : "");
-    } else {
-        snprintf(buf, sizeof(buf), "G..");
-    }
-    textAt(BAR_GNSS_X, BAR_TEXT_Y, buf);
-    drawVDivider(BAR_DIV_3);
-
-    // -- time and power.
-    if (gCtx.clockValid) {
-        snprintf(buf, sizeof(buf), "%02u:%02u", static_cast<unsigned>(gCtx.clockHour),
-                 static_cast<unsigned>(gCtx.clockMinute));
-    } else {
-        snprintf(buf, sizeof(buf), "--:--");
-    }
-    textAt(BAR_CLOCK_X, BAR_TEXT_Y, buf);
-
-    drawBatteryGlyph(BAR_BATT_X, BAR_TEXT_Y, gCtx.batteryValid, gCtx.batteryPercent);
-    if (gCtx.batteryValid) {
-        snprintf(buf, sizeof(buf), "%u%%", static_cast<unsigned>(gCtx.batteryPercent));
-    } else {
-        snprintf(buf, sizeof(buf), "--%%");
-    }
-    textRight(SCREEN_W - 2, BAR_TEXT_Y, buf);
-
-    d.drawFastHLine(0, STATUS_H, SCREEN_W, BLACK);
+    if (gCtx.idle) snprintf(buf, sizeof(buf), "IDLE");
+    char health[24];
+    snprintf(health, sizeof(health), "%s %.8s", gCtx.wifiConnected ? "FEED" : "OFFLINE", buf);
+    textRight(SCREEN_W - 6, 22, health);
+    drawBatteryGlyph(190, 8, gCtx.batteryValid, gCtx.batteryPercent);
+    if (gCtx.batteryValid) snprintf(buf, sizeof(buf), "%u%%", gCtx.batteryPercent);
+    else snprintf(buf, sizeof(buf), "--%%");
+    textRight(SCREEN_W - 6, 8, buf);
+    d.drawFastHLine(0, STATUS_H - 1, SCREEN_W, BLACK);
 }
 
 void drawFooterFrame() {
-    g().drawFastHLine(0, FOOTER_Y - 1, SCREEN_W, BLACK);
+    g().drawFastHLine(0, FOOTER_Y, SCREEN_W, BLACK);
 }
 
 void drawFooterLines(const char *line1, const char *line2) {
     drawFooterFrame();
-    if (line1) textAt(2, FOOTER_Y + 3, line1);
-    if (line2) textAt(2, FOOTER_Y + 12, line2);
+    if (line1) textAt(4, FOOTER_Y + 8, line1);
+    if (line2) textAt(4, FOOTER_Y + 15, line2);
 }
 
-// Footer showing the current selection, or the key legend when nothing is
-// selected.
-void drawSelectionFooter(const char *hints) {
+void drawNavBar(bool secondary = false) {
+    Adafruit_GFX &d = g();
+    drawFooterFrame();
+    if (secondary) {
+        d.drawRect(4, NAV_Y + 3, 64, FOOTER_H - 6, BLACK);
+        textAt(14, NAV_Y + 10, "< BACK");
+        textRight(SCREEN_W - 6, NAV_Y + 10, gView == View::Detail ? "J/K NEXT TARGET" : "W/S SCROLL");
+        return;
+    }
+    constexpr int16_t kTabW = SCREEN_W / 3;
+    const char *labels[3] = {"SCOPE", "LIST", "SETUP"};
+    const View views[3] = {View::Radar, View::List, View::Settings};
+    for (int i = 0; i < 3; ++i) {
+        const int16_t x = static_cast<int16_t>(i * kTabW);
+        if (views[i] == gView) d.fillRect(x + 3, NAV_Y + 3, kTabW - 6, FOOTER_H - 6, BLACK);
+        textAt(x + (kTabW - strlen(labels[i]) * CHAR_W) / 2, NAV_Y + 10,
+               labels[i], views[i] == gView ? WHITE : BLACK);
+    }
+}
+
+void drawTargetReadout() {
+    g().drawFastHLine(0, READOUT_Y, SCREEN_W, BLACK);
+    constexpr int16_t kTextWidth = SCREEN_W - 10;
+    char line[64];
     const Aircraft *a = selected();
     if (!a) {
-        drawFooterLines(hints, nullptr);
+        const unsigned count = gCtx.tracker
+                                   ? static_cast<unsigned>(gCtx.tracker->count())
+                                   : 0;
+        snprintf(line, sizeof(line), "%u AIRCRAFT", count);
+        textBounded(6, READOUT_Y + 6, kTextWidth, line, BLACK, 2);
+        snprintf(line, sizeof(line), "%s / %s", filter::name(), adsb::providerName());
+        textBounded(6, READOUT_Y + 29, kTextWidth, line);
+        textBounded(6, READOUT_Y + 45, kTextWidth,
+                    !gCtx.wifiConnected ? "WAITING FOR WI-FI" : "TAP AIRCRAFT / J-K TO SELECT");
         return;
     }
 
+    const int16_t callsignWidth = kTextWidth - 54;
+    textBounded(6, READOUT_Y + 5, callsignWidth, a->label(), BLACK, 2);
+    textRight(SCREEN_W - 6, READOUT_Y + 9, a->emergency ? "ALERT" : (gFollowAircraft ? "FOLLOW" : "DETAIL >"));
+
     char alt[12];
     formatAltitude(*a, alt, sizeof(alt));
-
-    char line1[48];
-    snprintf(line1, sizeof(line1), "%-8s %-6s%c %3.0f%s", a->label(), alt,
-             verticalTrendChar(*a), geo::displaySpeed(a->groundSpeedKt),
-             geo::speedUnitLabel());
-
-    char line2[48];
+    snprintf(line, sizeof(line), "ALT %s%c  SPD %3.0f%s", alt, verticalTrendChar(*a),
+             geo::displaySpeed(a->groundSpeedKt), geo::speedUnitLabel());
+    textBounded(6, READOUT_Y + 29, kTextWidth, line);
     if (a->hasPosition) {
-        snprintf(line2, sizeof(line2), "%-4s %5.1f%s %03.0f %s", a->type,
-                 geo::displayDistance(a->distanceNm), geo::distanceUnitLabel(),
-                 a->bearingDeg, geo::compassPoint(a->bearingDeg));
+        snprintf(line, sizeof(line), "%s  %4.1f%s  %03.0f %s",
+                 a->type[0] ? a->type : "----", geo::displayDistance(a->distanceNm),
+                 geo::distanceUnitLabel(), a->bearingDeg,
+                 geo::compassPoint(a->bearingDeg));
     } else {
-        snprintf(line2, sizeof(line2), "%-4s  no position", a->type);
+        snprintf(line, sizeof(line), "%s  NO POSITION",
+                 a->type[0] ? a->type : "----");
     }
-    drawFooterLines(line1, line2);
+    textBounded(6, READOUT_Y + 45, kTextWidth, line);
 }
 
 // --------------------------------------------------------- radar view ------
@@ -552,6 +778,31 @@ void drawAircraftMarker(int16_t x, int16_t y, const Aircraft &a, bool isSelected
     }
 }
 
+void drawAircraftTrail(const Aircraft &a) {
+    if (a.trailCount < 2) return;
+
+    Adafruit_GFX &d = g();
+    bool havePrev = false;
+    int16_t prevX = 0, prevY = 0;
+    const uint8_t first =
+        (a.trailCount == AIRCRAFT_TRAIL_POINTS) ? a.trailNext : 0;
+
+    for (uint8_t i = 0; i < a.trailCount; ++i) {
+        const uint8_t slot =
+            static_cast<uint8_t>((first + i) % AIRCRAFT_TRAIL_POINTS);
+        int16_t x = 0, y = 0;
+        const bool visible =
+            radarLatLonPosition(a.trail[slot].lat, a.trail[slot].lon, &x, &y);
+        if (visible) {
+            d.fillCircle(x, y, 1, BLACK);
+            if (havePrev) d.drawLine(prevX, prevY, x, y, BLACK);
+        }
+        havePrev = visible;
+        prevX = x;
+        prevY = y;
+    }
+}
+
 // Zoom out / zoom in, plus a recentre button that only appears once the plot
 // has been dragged away from our own position.
 void drawRadarButtons() {
@@ -572,6 +823,23 @@ void drawRadarButtons() {
         d.drawFastVLine(cx, cy - 6, 13, BLACK);
         d.fillCircle(cx, cy, 2, BLACK);
     }
+
+    // Lock-on: shown once a positioned target is selected, filled while the
+    // plot is chasing it. Top-right, opposite the recentre crosshair.
+    const Aircraft *followed = selected();
+    if (gFollowAircraft || (followed && followed->hasPosition)) {
+        const uint16_t ink = gFollowAircraft ? WHITE : BLACK;
+        if (gFollowAircraft) {
+            d.fillRect(BTN_FOLLOW_X, BTN_FOLLOW_Y, BTN, BTN, BLACK);
+        } else {
+            d.drawRect(BTN_FOLLOW_X, BTN_FOLLOW_Y, BTN, BTN, BLACK);
+        }
+        const int16_t cx = BTN_FOLLOW_X + BTN / 2;
+        const int16_t cy = BTN_FOLLOW_Y + BTN / 2;
+        d.drawCircle(cx, cy, 5, ink);
+        d.drawFastHLine(cx - 3, cy, 7, ink);
+        d.drawFastVLine(cx, cy - 3, 7, ink);
+    }
 }
 
 bool inButton(int16_t x, int16_t y, int16_t bx, int16_t by) {
@@ -591,12 +859,12 @@ void drawRadar() {
                       currentRangeNm());
     }
 
-    // Range rings at a third, two thirds and full range.
-    for (int i = 1; i <= 3; ++i) {
-        const int16_t r = static_cast<int16_t>(RADAR_R * i / 3);
+    // Aircraft traffic displays favour an uncluttered half/full range scale.
+    for (int i = 1; i <= 2; ++i) {
+        const int16_t r = static_cast<int16_t>(RADAR_R * i / 2);
         d.drawCircle(RADAR_CX, RADAR_CY, r, BLACK);
         snprintf(buf, sizeof(buf), "%.0f", geo::displayDistance(
-                                               currentRangeNm() * i / 3.0f));
+                                               currentRangeNm() * i / 2.0f));
         textAt(static_cast<int16_t>(RADAR_CX + 3),
                static_cast<int16_t>(RADAR_CY - r - 1), buf);
     }
@@ -606,8 +874,8 @@ void drawRadar() {
     d.drawFastVLine(RADAR_CX, RADAR_CY + RADAR_R - 4, 8, BLACK);
     d.drawFastHLine(RADAR_CX - RADAR_R - 4, RADAR_CY, 8, BLACK);
     d.drawFastHLine(RADAR_CX + RADAR_R - 4, RADAR_CY, 8, BLACK);
-    textAt(RADAR_CX - 2, RADAR_CY - RADAR_R - 13, "N");
-    textAt(RADAR_CX - 2, RADAR_CY + RADAR_R + 6, "S");
+    textAt(RADAR_CX - 2, SCOPE_Y + 2, "N");
+    textAt(RADAR_CX - 2, RADAR_CY + RADAR_R + 2, "S");
     textAt(RADAR_CX + RADAR_R + 6, RADAR_CY - 3, "E");
     textAt(RADAR_CX - RADAR_R - 12, RADAR_CY - 3, "W");
 
@@ -623,38 +891,67 @@ void drawRadar() {
         if (isPanned()) d.drawCircle(ox, oy, 6, BLACK);
     }
 
-    if (!gCtx.tracker) return;
+    if (!gCtx.tracker) {
+        drawRadarButtons();
+        drawTargetReadout();
+        drawNavBar();
+        return;
+    }
 
     const int selIdx = selectionIndex();
-    int labelled = 0;
     int plotted = 0;
 
+    if (selIdx >= 0 && selIdx < static_cast<int>(gCtx.tracker->count())) {
+        drawAircraftTrail(gCtx.tracker->at(static_cast<size_t>(selIdx)));
+    }
+
+    // Draw symbols first so the selected label can claim space before the
+    // remaining labels are placed.
     for (size_t i = 0; i < gCtx.tracker->count(); ++i) {
         const Aircraft &a = gCtx.tracker->at(i);
         int16_t x = 0, y = 0;
         if (!radarPosition(a, &x, &y)) continue;
         ++plotted;
+        drawAircraftMarker(x, y, a, static_cast<int>(i) == selIdx);
+    }
 
-        const bool isSelected = (static_cast<int>(i) == selIdx);
-        drawAircraftMarker(x, y, a, isSelected);
-
-        if (labelled < kMaxLabels || isSelected) {
-            char alt[12];
-            formatAltitude(a, alt, sizeof(alt));
-
-            // Nudge labels back inside the panel so long callsigns stay legible.
-            int16_t lx = x + 7;
-            const int16_t widest = static_cast<int16_t>(
-                strlen(a.label()) > strlen(alt) ? strlen(a.label()) : strlen(alt));
-            if (lx + widest * CHAR_W > SCREEN_W - 2) {
-                lx = static_cast<int16_t>(x - 7 - widest * CHAR_W);
+    struct LabelBox { int16_t x1, y1, x2, y2; };
+    LabelBox boxes[kMaxLabels + 1];
+    int labelled = 0;
+    auto placeLabel = [&](int idx, bool selectedLabel) {
+        if (idx < 0 || idx >= static_cast<int>(gCtx.tracker->count())) return;
+        const int labelLimit = kMaxLabels + (selIdx >= 0 ? 1 : 0);
+        if (!selectedLabel && labelled >= labelLimit) return;
+        const Aircraft &a = gCtx.tracker->at(static_cast<size_t>(idx));
+        int16_t x = 0, y = 0;
+        if (!radarPosition(a, &x, &y)) return;
+        char alt[12];
+        formatAltitude(a, alt, sizeof(alt));
+        const int16_t widest = static_cast<int16_t>(
+            strlen(a.label()) > strlen(alt) ? strlen(a.label()) : strlen(alt));
+        int16_t lx = static_cast<int16_t>(x + 7);
+        if (lx + widest * CHAR_W > SCREEN_W - 2)
+            lx = static_cast<int16_t>(x - 7 - widest * CHAR_W);
+        if (lx < 1) lx = 1;
+        int16_t ly = static_cast<int16_t>(y - 8);
+        if (ly < SCOPE_Y) ly = SCOPE_Y;
+        if (ly + 17 >= READOUT_Y) ly = READOUT_Y - 18;
+        LabelBox candidate{lx, ly, static_cast<int16_t>(lx + widest * CHAR_W),
+                           static_cast<int16_t>(ly + 17)};
+        if (!selectedLabel) {
+            for (int b = 0; b < labelled; ++b) {
+                if (candidate.x1 <= boxes[b].x2 && candidate.x2 >= boxes[b].x1 &&
+                    candidate.y1 <= boxes[b].y2 && candidate.y2 >= boxes[b].y1)
+                    return;
             }
-            if (lx < 1) lx = 1;
-
-            textAt(lx, static_cast<int16_t>(y - 8), a.label());
-            textAt(lx, static_cast<int16_t>(y + 1), alt);
-            ++labelled;
         }
+        boxes[labelled++] = candidate;
+        textAt(lx, ly, a.label());
+        textAt(lx, static_cast<int16_t>(ly + 9), alt);
+    };
+    placeLabel(selIdx, true);
+    for (size_t i = 0; i < gCtx.tracker->count(); ++i) {
+        if (static_cast<int>(i) != selIdx) placeLabel(static_cast<int>(i), false);
     }
 
     // The range now reads out in the status bar, so all this corner has left
@@ -684,13 +981,8 @@ void drawRadar() {
 
     drawRadarButtons();
 
-    // Naming the feed in the hint line does double duty: it says which source
-    // the plot came from, and it says which key changes it. Dragging is the
-    // one thing on this screen nobody needs telling about.
-    char hints[48];
-    snprintf(hints, sizeof(hints), "p:%s  t:list  z/x:zoom  m:map",
-             adsb::providerName());
-    drawSelectionFooter(isPanned() ? "drag:pan  c:recentre  z/x:zoom" : hints);
+    drawTargetReadout();
+    drawNavBar();
 }
 
 // ---------------------------------------------------------- list view ------
@@ -698,54 +990,63 @@ void drawList() {
     Adafruit_GFX &d = g();
     char buf[64];
 
-    d.fillRect(0, CONTENT_Y, SCREEN_W, ROW_H, BLACK);
-    textAt(2, CONTENT_Y + 2, "CALLSIGN  ALT    SPD  DIST  BRG", WHITE);
-
     if (!gCtx.tracker || gCtx.tracker->count() == 0) {
-        textAt(2, CONTENT_Y + ROW_H + 8,
-               gCtx.wifiConnected ? "No traffic in range." : "Waiting for Wi-Fi...");
-        drawFooterLines("t:radar  r:refresh  i:diag", nullptr);
+        const char *msg = !gCtx.wifiConnected ? "Waiting for Wi-Fi..."
+                          : (gCtx.lastFetch.received > 0 ? "All traffic filtered."
+                                                         : "No traffic in range.");
+        textAt(8, CONTENT_Y + 64, "NO AIRCRAFT", BLACK, 2);
+        textBounded(8, CONTENT_Y + 92, SCREEN_W - 16, msg);
+        textAt(8, CONTENT_Y + 112, "R refresh / O settings");
+        drawNavBar();
         return;
     }
 
-    const int rows = (CONTENT_H - ROW_H) / ROW_H;
-    const int total = static_cast<int>(gCtx.tracker->count());
-    const int selIdx = selectionIndex();
+    rebuildListOrder();
+    const int rows = CONTENT_H / ROW_H;
+    const int total = gListCount;
+    const int selStore = selectionIndex();
+    const int selVis = visualIndexOfStore(selStore);
 
-    // Keep the selection on screen.
-    if (selIdx >= 0) {
-        if (selIdx < gListTop) gListTop = selIdx;
-        if (selIdx >= gListTop + rows) gListTop = selIdx - rows + 1;
+    if (gListFollowSelection && selVis >= 0 && selStore >= 0) {
+        if (selVis < gListTop) gListTop = selVis;
+        if (selVis >= gListTop + rows) gListTop = selVis - rows + 1;
     }
     if (gListTop > total - rows) gListTop = total - rows;
     if (gListTop < 0) gListTop = 0;
 
     for (int r = 0; r < rows; ++r) {
-        const int idx = gListTop + r;
-        if (idx >= total) break;
+        const int vis = gListTop + r;
+        if (vis >= total) break;
+        const int idx = gListOrder[vis];
         const Aircraft &a = gCtx.tracker->at(static_cast<size_t>(idx));
-        const int16_t y = static_cast<int16_t>(CONTENT_Y + ROW_H + r * ROW_H);
-        const bool isSelected = (idx == selIdx);
+        const int16_t y = static_cast<int16_t>(CONTENT_Y + r * ROW_H);
+        const bool isSelected = (idx == selStore);
 
-        if (isSelected) d.fillRect(0, y, SCREEN_W, ROW_H, BLACK);
+        if (isSelected) d.fillRect(3, y + 2, SCREEN_W - 9, ROW_H - 4, BLACK);
 
         char alt[12];
         formatAltitude(a, alt, sizeof(alt));
 
+        const uint16_t ink = isSelected ? WHITE : BLACK;
+        textBounded(8, y + 6, 132, a.label(), ink, 2);
+        snprintf(buf, sizeof(buf), "%s%c", alt, verticalTrendChar(a));
+        textRight(SCREEN_W - 10, y + 10, buf, ink);
         if (a.hasPosition) {
-            snprintf(buf, sizeof(buf), "%-8s %-6s%c %3.0f %5.1f %03.0f", a.label(),
-                     alt, verticalTrendChar(a), geo::displaySpeed(a.groundSpeedKt),
-                     geo::displayDistance(a.distanceNm), a.bearingDeg);
+            snprintf(buf, sizeof(buf), "%-5s  %3.0f%s   %4.1f%s   %03.0f",
+                     a.type[0] ? a.type : "----", geo::displaySpeed(a.groundSpeedKt),
+                     geo::speedUnitLabel(), geo::displayDistance(a.distanceNm),
+                     geo::distanceUnitLabel(), a.bearingDeg);
         } else {
-            snprintf(buf, sizeof(buf), "%-8s %-6s%c %3.0f   --    --", a.label(),
-                     alt, verticalTrendChar(a), geo::displaySpeed(a.groundSpeedKt));
+            snprintf(buf, sizeof(buf), "%-5s  %3.0f%s   NO POSITION",
+                     a.type[0] ? a.type : "----", geo::displaySpeed(a.groundSpeedKt),
+                     geo::speedUnitLabel());
         }
-        textAt(2, static_cast<int16_t>(y + 2), buf, isSelected ? WHITE : BLACK);
+        textBounded(8, y + 27, SCREEN_W - 18, buf, ink);
+        if (!isSelected) d.drawFastHLine(8, y + ROW_H - 1, SCREEN_W - 18, BLACK);
     }
 
     if (total > rows) {
-        // Scroll position indicator down the right edge.
-        const int16_t trackTop = CONTENT_Y + ROW_H;
+        const int16_t trackTop = CONTENT_Y;
         const int16_t trackH = static_cast<int16_t>(rows * ROW_H);
         const int16_t barH = static_cast<int16_t>(
             trackH * rows / total > 4 ? trackH * rows / total : 4);
@@ -754,146 +1055,100 @@ void drawList() {
         d.fillRect(SCREEN_W - 3, barY, 3, barH, BLACK);
     }
 
-    drawSelectionFooter("t:radar  w/s:move  E:info  r:refresh");
+    drawNavBar();
 }
 
 // -------------------------------------------------------- detail view ------
 void drawDetail() {
     const Aircraft *a = selected();
     if (!a) {
-        textAt(4, CONTENT_Y + 8, "Nothing selected.");
-        drawFooterLines("U:back", nullptr);
+        textAt(8, CONTENT_Y + 64, "NO SELECTION", BLACK, 2);
+        textAt(8, CONTENT_Y + 92, "Choose an aircraft on radar or list.");
+        drawNavBar(true);
         return;
     }
-
+    Adafruit_GFX &d = g();
     char buf[64];
-    int16_t y = CONTENT_Y + 6;
-
-    textAt(4, y, a->label(), BLACK, 2);
-    y += 20;
-
-    // What the aircraft actually is, in words. The feed never carries this --
-    // an aggregator sends a four-letter type designator at best and a local
-    // receiver sends nothing at all -- so it comes from the flashed table.
-    // Looked up here rather than kept on every Aircraft: the detail page shows
-    // one target, where the tracker holds MAX_AIRCRAFT of them.
     aircraftdb::Details db;
     const bool known = aircraftdb::details(a->hex, &db);
+    const char *type = a->type[0] ? a->type : (known && db.type[0] ? db.type : "----");
+    const char *reg = a->reg[0] ? a->reg : (known && db.reg[0] ? db.reg : "--");
+    textBounded(8, CONTENT_Y + 7, SCREEN_W - 16, a->label(), BLACK, 2);
+    snprintf(buf, sizeof(buf), "%s  /  %s  /  %s", reg, type, a->hex);
+    textBounded(8, CONTENT_Y + 29, SCREEN_W - 16, buf);
+    textBounded(8, CONTENT_Y + 44, SCREEN_W - 16,
+                known && db.op[0] ? db.op : "Operator not reported");
 
-    if (known && db.desc[0]) {
-        // 40 columns at this size; descriptions run to 47, so wrap once on a
-        // space rather than truncating mid-word.
-        const int kCols = SCREEN_W / CHAR_W - 1;
-        const int len = static_cast<int>(strlen(db.desc));
-        if (len <= kCols) {
-            textAt(4, y, db.desc);
-            y += 10;
-        } else {
-            int split = kCols;
-            while (split > 0 && db.desc[split] != ' ') --split;
-            if (split == 0) split = kCols;  // one very long word
-            char line[48];
-            const size_t n = static_cast<size_t>(split) < sizeof(line)
-                                 ? static_cast<size_t>(split)
-                                 : sizeof(line) - 1;
-            memcpy(line, db.desc, n);
-            line[n] = '\0';
-            textAt(4, y, line);
-            y += 10;
-            textAt(4, y, db.desc + split + (db.desc[split] == ' ' ? 1 : 0));
-            y += 10;
-        }
-    }
-
-    // Who operates it, on its own full-width line rather than as a row: these
-    // run to 47 characters where every row value fits in nine, and giving it a
-    // column would have squeezed everything else or collided with the
-    // silhouette on the right.
-    if (known && db.op[0]) {
-        snprintf(buf, sizeof(buf), "%.39s", db.op);
-        textAt(4, y, buf);
-        y += 10;
-    }
-
-    g().drawFastHLine(4, y, SCREEN_W - 8, BLACK);
-    y += 6;
-
-    // Plan-view silhouette, right-aligned against the rows below. Drawn from
-    // the feed's type designator where it has one and the database's
-    // otherwise, so it still appears for a local receiver that sends neither.
-    const char *iconType = a->type[0] ? a->type : (known ? db.type : "");
-    int16_t iconW = 0, iconH = 0;
-    if (iconType[0] && icons::size(iconType, &iconW, &iconH)) {
-        icons::draw(iconType, static_cast<int16_t>(SCREEN_W - 4 - iconW),
-                    static_cast<int16_t>(y + 2));
-    }
-
-    auto row = [&](const char *label, const char *value) {
-        textAt(4, y, label);
-        textAt(4 + 11 * CHAR_W, y, value);
-        y += 12;
-    };
-
-    row("ICAO", a->hex);
-    // The feed's value wins where it has one; the table fills the gap it
-    // leaves. Neither is second-guessed against the other.
-    row("Reg", a->reg[0] ? a->reg : (known && db.reg[0] ? db.reg : "--"));
-    row("Type", a->type[0] ? a->type : (known && db.type[0] ? db.type : "--"));
-
-    if (known && db.year != 0) {
-        snprintf(buf, sizeof(buf), "%u", static_cast<unsigned>(db.year));
-        row("Built", buf);
-    }
-
-    row("Squawk", a->squawk[0] ? a->squawk : "--");
-
+    const int16_t metricY = CONTENT_Y + 62;
+    d.drawFastHLine(8, metricY, SCREEN_W - 16, BLACK);
+    d.drawFastVLine(SCREEN_W / 2, metricY + 5, 43, BLACK);
+    textAt(8, metricY + 8, "ALTITUDE");
+    textAt(SCREEN_W / 2 + 8, metricY + 8, "GROUND SPEED");
     char alt[12];
     formatAltitude(*a, alt, sizeof(alt));
-    snprintf(buf, sizeof(buf), "%s", alt);
-    row("Altitude", buf);
+    textBounded(8, metricY + 24, SCREEN_W / 2 - 16, alt, BLACK, 2);
+    snprintf(buf, sizeof(buf), "%.0f", geo::displaySpeed(a->groundSpeedKt));
+    const size_t speedChars = textBounded(SCREEN_W / 2 + 8, metricY + 24,
+                                         SCREEN_W / 2 - 40, buf, BLACK, 2);
+    textAt(SCREEN_W / 2 + 8 + speedChars * CHAR_W * 2, metricY + 31,
+           geo::speedUnitLabel());
+    d.drawFastHLine(8, metricY + 51, SCREEN_W - 16, BLACK);
 
-    snprintf(buf, sizeof(buf), "%+d fpm", static_cast<int>(a->verticalRateFpm));
-    row("V/S", buf);
-
-    snprintf(buf, sizeof(buf), "%.0f %s", geo::displaySpeed(a->groundSpeedKt),
-             geo::speedUnitLabel());
-    row("Speed", buf);
-
-    if (a->hasTrack) {
-        snprintf(buf, sizeof(buf), "%03.0f %s", a->trackDeg,
-                 geo::compassPoint(a->trackDeg));
+    int16_t y = metricY + 61;
+    // Keep the original type-specific silhouette beside the flight data.
+    // Feed type takes priority; the database supplies it for local feeds.
+    int16_t iconW = 0, iconH = 0;
+    const bool hasIcon = icons::size(type, &iconW, &iconH) &&
+                         iconW <= 88 && iconH <= 104;
+    if (hasIcon) {
+        icons::draw(type, SCREEN_W - 8 - iconW, y);
+    }
+    const int16_t valueX = hasIcon ? 56 : 86;
+    const int16_t valueWidth = hasIcon ? SCREEN_W - 16 - iconW - valueX
+                                      : SCREEN_W - 94;
+    auto row = [&](const char *label, const char *value) {
+        labelAt(8, y, label);
+        textBounded(valueX, y, valueWidth, value);
+        y += 16;
+    };
+    if (a->hasPosition) {
+        snprintf(buf, sizeof(buf), "%.1f %s",
+                 geo::displayDistance(a->distanceNm), geo::distanceUnitLabel());
     } else {
+        snprintf(buf, sizeof(buf), "not reported");
+    }
+    row("Range", buf);
+    if (a->hasTrack) snprintf(buf, sizeof(buf), "%03.0f %s", a->trackDeg, geo::compassPoint(a->trackDeg));
+    else snprintf(buf, sizeof(buf), "--");
+    row("Track", buf);
+    snprintf(buf, sizeof(buf), "%+d fpm", static_cast<int>(a->verticalRateFpm));
+    row("Climb", buf);
+    row("Squawk", a->squawk[0] ? a->squawk : "--");
+    if (a->hasPosition) {
+        snprintf(buf, sizeof(buf), "%03.0f %s", a->bearingDeg, geo::compassPoint(a->bearingDeg));
+        row("Brg", buf);
+        snprintf(buf, sizeof(buf), "%.0f s ago", a->seenPosSec);
+    } else {
+        row("Brg", "--");
         snprintf(buf, sizeof(buf), "--");
     }
-    row("Track", buf);
-
+    row("Age", buf);
     if (a->hasPosition) {
-        snprintf(buf, sizeof(buf), "%.1f %s", geo::displayDistance(a->distanceNm),
-                 geo::distanceUnitLabel());
-        row("Range", buf);
-
-        snprintf(buf, sizeof(buf), "%03.0f %s", a->bearingDeg,
-                 geo::compassPoint(a->bearingDeg));
-        row("Bearing", buf);
-
-        snprintf(buf, sizeof(buf), "%.4f", a->lat);
-        row("Lat", buf);
-        snprintf(buf, sizeof(buf), "%.4f", a->lon);
-        row("Lon", buf);
-
-        snprintf(buf, sizeof(buf), "%.0f s ago", a->seenPosSec);
-        row("Pos age", buf);
-    } else {
-        row("Position", "not reported");
+        snprintf(buf, sizeof(buf), "POS %.4f, %.4f", a->lat, a->lon);
+        textBounded(8, FOOTER_Y - 32, SCREEN_W - 16, buf);
     }
-
+    // Reserve one bottom strip for aircraft identity or an emergency banner.
     if (a->emergency) {
-        y += 4;
-        g().fillRect(4, y, SCREEN_W - 8, 12, BLACK);
-        textAt(8, y + 2, "EMERGENCY / SPECIAL SQUAWK", WHITE);
+        d.fillRect(4, FOOTER_Y - 23, SCREEN_W - 8, 19, BLACK);
+        textAt(8, FOOTER_Y - 17, "EMERGENCY / SPECIAL SQUAWK", WHITE);
+    } else {
+        snprintf(buf, sizeof(buf), "%s%s%u", known && db.desc[0] ? db.desc : type,
+                 known && db.year ? " / " : "", known && db.year ? db.year : 0);
+        // Do not append a synthetic year when the database has none.
+        if (!(known && db.year)) snprintf(buf, sizeof(buf), "%s", known && db.desc[0] ? db.desc : type);
+        textBounded(8, FOOTER_Y - 17, SCREEN_W - 16, buf);
     }
-
-    drawFooterLines("U:back  w/s:next target", nullptr);
+    drawNavBar(true);
 }
 
 // -------------------------------------------------------- status view ------
@@ -901,10 +1156,11 @@ void drawStatus() {
     char buf[64];
     const int16_t heading = CONTENT_Y + 6;
 
-    textAt(4, heading, "Diagnostics", BLACK, 2);
+    textAt(8, heading, "DIAGNOSTICS");
+    textRight(SCREEN_W - 8, heading, "W/S SCROLL");
 
     // The heading stays put and the rows scroll under it.
-    constexpr int16_t kRowH = 12;
+    constexpr int16_t kRowH = STATUS_ROW_H;
     const int16_t top = CONTENT_Y + 28;
     const int visible = (FOOTER_Y - top) / kRowH;
 
@@ -917,8 +1173,8 @@ void drawStatus() {
         const int i = index++;
         if (i < gStatusTop || i >= gStatusTop + visible) return;
         const int16_t y = static_cast<int16_t>(top + (i - gStatusTop) * kRowH);
-        textAt(4, y, label);
-        textAt(4 + 11 * CHAR_W, y, value);
+        labelAt(8, y + 3, label);
+        textBounded(80, y + 3, SCREEN_W - 88, value);
     };
 
     row("Firmware", "adsb 0.1");
@@ -1007,6 +1263,8 @@ void drawStatus() {
     row("GNSS link", buf);
 
     row("Map", gMapEnabled ? basemap::status() : "off");
+    row("SD", sdcard::status());
+    row("Shot", sdcard::lastShot());
 
     uint8_t ch = 0, cm = 0, cs = 0;
     if (wallclock::localHms(&ch, &cm, &cs)) {
@@ -1022,7 +1280,8 @@ void drawStatus() {
     row("Own lat", buf);
     snprintf(buf, sizeof(buf), "%.4f", gCtx.ownLon);
     row("Own lon", buf);
-    row("Position", gCtx.ownFromGnss ? "GNSS" : "config");
+    row("Position", gCtx.ownFromGnss ? "GNSS"
+                    : (settings::get().homeOverride ? "saved home" : "config"));
 
     if (isPanned()) {
         snprintf(buf, sizeof(buf), "%+.0fE %+.0fN nm", gPanEastNm, gPanNorthNm);
@@ -1031,7 +1290,8 @@ void drawStatus() {
     }
     row("Pan", buf);
 
-    snprintf(buf, sizeof(buf), "%u nm", static_cast<unsigned>(currentRangeNm()));
+    snprintf(buf, sizeof(buf), "%.0f %s",
+             geo::displayDistance(currentRangeNm()), geo::distanceUnitLabel());
     row("Range", buf);
 
     if (gCtx.batteryValid) {
@@ -1042,6 +1302,62 @@ void drawStatus() {
         snprintf(buf, sizeof(buf), "gauge silent");
     }
     row("Battery", buf);
+
+    // The chip's own percentage, which is wrong until its design capacity
+    // matches the 1400 mAh cell. The row above is what the status bar shows.
+    if (power::gaugePercent() > 100) {
+        snprintf(buf, sizeof(buf), "no reading");
+    } else {
+        snprintf(buf, sizeof(buf), "%u%% of %u mAh",
+                 static_cast<unsigned>(power::gaugePercent()),
+                 static_cast<unsigned>(power::designMilliAmpHours()));
+    }
+    row("Gauge", buf);
+
+    // Ambient light also drives auto keypad backlight; the number lives here.
+    // IMU attitude drives face-down idle, and the vector lives here. Both are
+    // polled from main.cpp; the values are whatever the last sample was.
+    float lux = 0.0f;
+    if (!als::present()) {
+        snprintf(buf, sizeof(buf), "silent");
+    } else if (!als::lux(&lux)) {
+        snprintf(buf, sizeof(buf), "warming");
+    } else if (lux < 10.0f) {
+        snprintf(buf, sizeof(buf), "%.1f lx", lux);
+    } else {
+        snprintf(buf, sizeof(buf), "%.0f lx", lux);
+    }
+    row("ALS", buf);
+
+    float ax = 0.0f, ay = 0.0f, az = 0.0f;
+    if (!imu::present()) {
+        snprintf(buf, sizeof(buf), "silent");
+    } else if (!imu::acceleration(&ax, &ay, &az)) {
+        snprintf(buf, sizeof(buf), "warming");
+    } else {
+        snprintf(buf, sizeof(buf), "%+.1f %+.1f %+.1f", ax, ay, az);
+    }
+    row("IMU a", buf);
+    if (!imu::present()) {
+        row("IMU", "silent");
+    } else if (gCtx.idle) {
+        snprintf(buf, sizeof(buf), "%s IDLE", imu::orientation());
+        row("IMU", buf);
+    } else {
+        row("IMU", imu::orientation());
+    }
+
+    if (settings::localUrlOverride()) {
+        const char *u = settings::localUrl();
+        if (strlen(u) > 28) {
+            snprintf(buf, sizeof(buf), "...%s", u + strlen(u) - 25);
+        } else {
+            snprintf(buf, sizeof(buf), "%s", u);
+        }
+    } else {
+        snprintf(buf, sizeof(buf), "compiled");
+    }
+    row("Local URL", buf);
 
     if (gCtx.tracker) {
         snprintf(buf, sizeof(buf), "%u of %u",
@@ -1070,6 +1386,15 @@ void drawStatus() {
     }
     row("Last key", buf);
 
+    const touch::LastTap &tap = touch::lastTap();
+    if (tap.x < 0) {
+        snprintf(buf, sizeof(buf), "tap one");
+    } else {
+        snprintf(buf, sizeof(buf), "%d, %d", static_cast<int>(tap.x),
+                 static_cast<int>(tap.y));
+    }
+    row("Last tap", buf);
+
     // Whether duty cycling is actually winning. A module that keeps its
     // ephemeris across the sleep re-fixes in a second or two; one that cold
     // starts every time takes half a minute and saves far less, and the only
@@ -1097,6 +1422,7 @@ void drawStatus() {
     row("AC db", aircraftdb::status());
     row("Icons", icons::status());
     row("Settings", settings::status());
+    row("Track log", settings::logEnabled() ? "on" : "off");
 
     snprintf(buf, sizeof(buf), "%u k / %u k",
              static_cast<unsigned>(ESP.getFreeHeap() / 1024),
@@ -1126,7 +1452,428 @@ void drawStatus() {
         g().fillRect(SCREEN_W - 3, barY, 3, barH, BLACK);
     }
 
-    drawFooterLines("U:back  w/s:scroll", "g:GNSS centre  l:backlight");
+    drawNavBar(true);
+}
+
+const char *distanceName(uint8_t u) {
+    if (u == 1) return "miles";
+    if (u == 2) return "km";
+    return "nm";
+}
+
+const char *speedName(uint8_t u) {
+    if (u == 1) return "mph";
+    if (u == 2) return "kph";
+    return "knots";
+}
+
+const char *sortName(uint8_t u) {
+    switch (static_cast<ListSort>(u)) {
+        case ListSort::Alt: return "altitude";
+        case ListSort::Speed: return "speed";
+        case ListSort::Callsign: return "callsign";
+        case ListSort::Range:
+        default: return "range";
+    }
+}
+
+const char *paceName(uint8_t u) {
+    switch (static_cast<PollPace>(u)) {
+        case PollPace::Normal: return "normal";
+        case PollPace::Slow: return "slow";
+        case PollPace::Fast:
+        default: return "fast";
+    }
+}
+
+const char *filterLongName(uint8_t u) {
+    switch (static_cast<TrafficFilter>(u)) {
+        case TrafficFilter::Airborne: return "airborne";
+        case TrafficFilter::Low: return "below FL100";
+        case TrafficFilter::High: return "FL100+";
+        case TrafficFilter::All:
+        default: return "all";
+    }
+}
+
+void maskPassword(char *out, size_t len, const char *pass) {
+    const size_t n = strlen(pass);
+    if (n == 0) {
+        snprintf(out, len, "(empty)");
+        return;
+    }
+    size_t i = 0;
+    for (; i < n && i + 1 < len; ++i) out[i] = '*';
+    out[i] = '\0';
+}
+
+char symbolFor(char c) {
+    switch (c) {
+        case 'q': return '1';
+        case 'w': return '2';
+        case 'e': return '3';
+        case 'r': return '4';
+        case 't': return '5';
+        case 'y': return '6';
+        case 'u': return '7';
+        case 'i': return '8';
+        case 'o': return '9';
+        case 'p': return '0';
+        case 'a': return '!';
+        case 's': return '@';
+        case 'd': return '#';
+        case 'f': return '$';
+        case 'g': return '%';
+        case 'h': return '^';
+        case 'j': return '&';
+        case 'k': return '*';
+        case 'l': return '(';
+        case 'z': return '-';
+        case 'x': return '_';
+        case 'c': return '=';
+        case 'v': return '+';
+        case 'b': return '[';
+        case 'n': return ']';
+        case 'm': return '/';
+        case '-': return '?';
+        case '0': return ')';
+        default: return c;
+    }
+}
+
+char mapEditChar(char c) {
+    if (c == keypad::kShift || c == keypad::kSymbol || c == keypad::kEnter ||
+        c == keypad::kBackspace || c == keypad::kAlt || c == keypad::kMic) {
+        return 0;
+    }
+    if (gEditSym) {
+        // Local feed URLs need '.' and ':' more than brackets.
+        if (gEditField == EditField::LocalUrl) {
+            if (c == 'v') return '.';
+            if (c == 'b') return ':';
+        }
+        return symbolFor(c);
+    }
+    if (gEditShift && c >= 'a' && c <= 'z') return static_cast<char>(toupper(c));
+    return c;
+}
+
+void cancelEdit() {
+    gEditField = EditField::None;
+    gEditBuf[0] = '\0';
+    gEditShift = false;
+    gEditSym = false;
+}
+
+void startEdit(EditField field) {
+    gEditField = field;
+    gEditShift = false;
+    gEditSym = false;
+    if (field == EditField::Ssid) {
+        strncpy(gEditBuf, settings::wifiOverride() ? settings::wifiSsid()
+                                                   : gCtx.wifiSsid,
+                settings::kWifiSsidMax);
+        gEditBuf[settings::kWifiSsidMax] = '\0';
+    } else if (field == EditField::Pass) {
+        strncpy(gEditBuf, settings::wifiPass(), settings::kWifiPassMax);
+        gEditBuf[settings::kWifiPassMax] = '\0';
+    } else if (field == EditField::LocalUrl) {
+        const char *url = settings::localUrlOverride() ? settings::localUrl()
+                                                       : ADSB_LOCAL_URL;
+        strncpy(gEditBuf, url, settings::kLocalUrlMax);
+        gEditBuf[settings::kLocalUrlMax] = '\0';
+    }
+}
+
+void commitEdit() {
+    if (gEditField == EditField::Ssid) {
+        if (!gEditBuf[0]) {
+            settings::clearWifiOverride();
+        } else {
+            settings::setWifiOverride(gEditBuf, settings::wifiPass());
+        }
+        net::reconnect();
+    } else if (gEditField == EditField::Pass) {
+        const char *ssid = settings::wifiOverride() ? settings::wifiSsid()
+                                                    : gCtx.wifiSsid;
+        if (ssid && ssid[0]) {
+            settings::setWifiOverride(ssid, gEditBuf);
+            net::reconnect();
+        }
+    } else if (gEditField == EditField::LocalUrl) {
+        if (!gEditBuf[0]) {
+            settings::clearLocalUrl();
+        } else {
+            settings::setLocalUrl(gEditBuf);
+        }
+        gRefreshRequested = true;
+    }
+    cancelEdit();
+    display::invalidate();
+}
+
+void noteFilterChanged() {
+    gFilterChanged = true;
+    display::invalidate();
+}
+
+void cycleByte(uint8_t *v, uint8_t maxInclusive, int dir) {
+    const int next = static_cast<int>(*v) + dir;
+    if (next < 0) *v = maxInclusive;
+    else if (next > maxInclusive) *v = 0;
+    else *v = static_cast<uint8_t>(next);
+}
+
+void applySettingDelta(int dir) {
+    Settings &s = settings::get();
+    switch (static_cast<SetRow>(gSettingsRow)) {
+        case SetRow::Distance:
+            cycleByte(&s.distanceUnits, 2, dir);
+            settings::applyLive();
+            break;
+        case SetRow::Speed:
+            cycleByte(&s.speedUnits, 2, dir);
+            settings::applyLive();
+            break;
+        case SetRow::Traffic:
+            cycleByte(&s.trafficFilter, static_cast<uint8_t>(TrafficFilter::High),
+                      dir);
+            noteFilterChanged();
+            break;
+        case SetRow::Sort:
+            cycleByte(&s.listSort, static_cast<uint8_t>(ListSort::Callsign), dir);
+            gListFollowSelection = true;
+            break;
+        case SetRow::Poll:
+            cycleByte(&s.pollPace, static_cast<uint8_t>(PollPace::Slow), dir);
+            gPollPaceChanged = true;
+            break;
+        case SetRow::Feed:
+            adsb::toggleProvider();
+            gRefreshRequested = true;
+            break;
+        case SetRow::LocalUrl:
+            if (dir == 0) startEdit(EditField::LocalUrl);
+            return;
+        case SetRow::Map:
+            gMapEnabled = !gMapEnabled;
+            s.mapEnabled = gMapEnabled;
+            break;
+        case SetRow::MapFile:
+            sdcard::cycleMapPath(dir == 0 ? 1 : dir);
+            basemap::reload();
+            break;
+        case SetRow::Gnss:
+            gCentreOnGnss = !gCentreOnGnss;
+            s.centreOnGnss = gCentreOnGnss;
+            gPanEastNm = 0.0f;
+            gPanNorthNm = 0.0f;
+            break;
+        case SetRow::Backlight:
+            cycleByte(&s.keypadBacklight, static_cast<uint8_t>(BacklightMode::Auto),
+                      dir);
+            power::refreshKeypadBacklight(s.keypadBacklight);
+            break;
+        case SetRow::Idle:
+            settings::setFaceDownIdle(!settings::faceDownIdle());
+            break;
+        case SetRow::SwapXY:
+            s.swapXY = !s.swapXY;
+            settings::applyLive();
+            break;
+        case SetRow::MirrorX:
+            s.mirrorX = !s.mirrorX;
+            settings::applyLive();
+            break;
+        case SetRow::MirrorY:
+            s.mirrorY = !s.mirrorY;
+            settings::applyLive();
+            break;
+        case SetRow::Home:
+            if (dir == 0) {
+                s.homeLatE7 = static_cast<int32_t>(lround(gCtx.ownLat * 1e7));
+                s.homeLonE7 = static_cast<int32_t>(lround(gCtx.ownLon * 1e7));
+                s.homeOverride = true;
+            }
+            break;
+        case SetRow::WifiSsid:
+            if (dir == 0) startEdit(EditField::Ssid);
+            return;
+        case SetRow::WifiPass:
+            if (dir == 0) startEdit(EditField::Pass);
+            return;
+        case SetRow::TrackLog:
+            settings::setLogEnabled(!settings::logEnabled());
+            break;
+        case SetRow::System:
+            if (dir == 0) setView(View::Status);
+            return;
+        default:
+            break;
+    }
+    settings::markDirty();
+    persist();
+    display::invalidate();
+}
+
+void scrollSettings(int delta) {
+    const int visible = SETTINGS_VISIBLE;
+    int maxTop = gSettingsRows - visible;
+    if (maxTop < 0) maxTop = 0;
+    int next = gSettingsTop + delta;
+    if (next < 0) next = 0;
+    if (next > maxTop) next = maxTop;
+    if (next == gSettingsTop) return;
+    gSettingsTop = next;
+    display::invalidate();
+}
+
+void moveSettingsRow(int delta) {
+    int local = 0;
+    for (int i = 0; i < static_cast<int>(SetRow::Count); ++i) {
+        if (settingCategory(static_cast<SetRow>(i)) != gSettingsCategory) continue;
+        if (i == gSettingsRow) break;
+        ++local;
+    }
+    local += delta;
+    if (local < 0) local = gSettingsRows - 1;
+    if (local >= gSettingsRows) local = 0;
+    gSettingsRow = settingAtCategoryIndex(gSettingsCategory, local);
+    const int visible = SETTINGS_VISIBLE;
+    if (local < gSettingsTop) gSettingsTop = local;
+    if (local >= gSettingsTop + visible) {
+        gSettingsTop = local - visible + 1;
+    }
+    display::invalidate();
+}
+
+void drawSettings() {
+    char buf[48];
+    const Settings &s = settings::get();
+    const int16_t heading = CONTENT_Y + 6;
+    const char *tabs[4] = {"TRAFFIC", "DISPLAY", "CONNECT", "DEVICE"};
+    constexpr int16_t kTabW = SCREEN_W / 4;
+    for (int i = 0; i < 4; ++i) {
+        const int16_t x = static_cast<int16_t>(i * kTabW);
+        if (i == gSettingsCategory) g().fillRect(x, heading - 4, kTabW, 18, BLACK);
+        if (i) g().drawFastVLine(x, heading - 4, 18, BLACK);
+        textAt(x + 5, heading + 1, tabs[i], i == gSettingsCategory ? WHITE : BLACK);
+    }
+
+    constexpr int16_t kRowH = SETTINGS_ROW_H;
+    constexpr int16_t top = SETTINGS_TOP;
+    constexpr int visible = SETTINGS_VISIBLE;
+
+    int index = 0;
+    int categoryIndex = 0;
+    auto row = [&](const char *label, const char *value, bool editing) {
+        const int i = index++;
+        if (settingCategory(static_cast<SetRow>(i)) != gSettingsCategory) return;
+        const int ci = categoryIndex++;
+        if (ci < gSettingsTop || ci >= gSettingsTop + visible) return;
+        const int16_t y = static_cast<int16_t>(top + (ci - gSettingsTop) * kRowH);
+        const bool sel = (i == gSettingsRow);
+        if (sel) g().fillRect(3, y + 2, SCREEN_W - 9, kRowH - 4, BLACK);
+        const uint16_t colour = sel ? WHITE : BLACK;
+        labelAt(8, y + 6, label, colour);
+        // Leave room for the scrollbar and a cursor after the final character.
+        const int16_t valueWidth = SCREEN_W - 20 - (editing ? CHAR_W : 0);
+        const size_t shown = textBounded(8, y + 22, valueWidth,
+                                         editing ? gEditBuf : value, colour, 1,
+                                         editing);
+        if (sel && editing) {
+            const int16_t cx = static_cast<int16_t>(8 + shown * CHAR_W);
+            g().drawFastVLine(cx, y + 21, CHAR_H + 2, colour);
+        }
+        if (!sel) g().drawFastHLine(4, y + kRowH - 1, SCREEN_W - 12, BLACK);
+    };
+
+    row("Distance", distanceName(s.distanceUnits), false);
+    row("Speed", speedName(s.speedUnits), false);
+    row("Traffic", filterLongName(s.trafficFilter), false);
+    row("Sort", sortName(s.listSort), false);
+    row("Poll", paceName(s.pollPace), false);
+    row("Feed", adsb::providerName(), false);
+
+    if (gEditField == EditField::LocalUrl) {
+        row("Local URL", gEditBuf, true);
+    } else if (settings::localUrlOverride()) {
+        row("Local URL", settings::localUrl(), false);
+    } else {
+        row("Local URL", "compiled", false);
+    }
+
+    row("Map", gMapEnabled ? "on" : "off", false);
+    row("Map file", settings::mapLabel(), false);
+    row("GNSS ctr", gCentreOnGnss ? "on" : "off", false);
+    switch (s.keypadBacklight) {
+        case static_cast<uint8_t>(BacklightMode::On):
+            row("Backlight", "on", false);
+            break;
+        case static_cast<uint8_t>(BacklightMode::Auto):
+            row("Backlight", "auto", false);
+            break;
+        default:
+            row("Backlight", "off", false);
+            break;
+    }
+    row("Face idle", settings::faceDownIdle() ? "on" : "off", false);
+    row("Swap XY", s.swapXY ? "yes" : "no", false);
+    row("Mirror X", s.mirrorX ? "yes" : "no", false);
+    row("Mirror Y", s.mirrorY ? "yes" : "no", false);
+
+    if (s.homeOverride) {
+        snprintf(buf, sizeof(buf), "%.4f,%.4f", s.homeLatE7 * 1e-7,
+                 s.homeLonE7 * 1e-7);
+    } else {
+        snprintf(buf, sizeof(buf), "compiled");
+    }
+    row("Home", buf, false);
+
+    if (gEditField == EditField::Ssid) {
+        row("Wi-Fi", gEditBuf, true);
+    } else if (settings::wifiOverride()) {
+        row("Wi-Fi", settings::wifiSsid(), false);
+    } else {
+        row("Wi-Fi", "compiled", false);
+    }
+
+    if (gEditField == EditField::Pass) {
+        row("Password", gEditBuf, true);
+    } else {
+        maskPassword(buf, sizeof(buf), settings::wifiPass());
+        row("Password", settings::wifiOverride() ? buf : "compiled", false);
+    }
+
+    row("Track log", settings::logEnabled() ? "on" : "off", false);
+    row("System", "open", false);
+
+    gSettingsRows = categoryIndex;
+
+    if (categoryIndex > visible) {
+        const int16_t trackH = static_cast<int16_t>(visible * kRowH);
+        int16_t barH = static_cast<int16_t>(trackH * visible / categoryIndex);
+        if (barH < 4) barH = 4;
+        const int16_t barY = static_cast<int16_t>(
+            top + (trackH - barH) * gSettingsTop / (categoryIndex - visible));
+        g().fillRect(SCREEN_W - 3, barY, 3, barH, BLACK);
+    }
+
+    if (gEditField != EditField::None) {
+        drawFooterLines("E:save  U:cancel  S:shift  $:sym", nullptr);
+    } else {
+        drawNavBar();
+    }
+}
+
+void activateSetting() {
+    const SetRow row = static_cast<SetRow>(gSettingsRow);
+    if (row == SetRow::Home || row == SetRow::WifiSsid || row == SetRow::WifiPass ||
+        row == SetRow::LocalUrl || row == SetRow::System) {
+        applySettingDelta(0);
+    } else {
+        applySettingDelta(1);
+    }
 }
 
 void drawCurrentView() {
@@ -1136,13 +1883,14 @@ void drawCurrentView() {
         case View::List: drawList(); break;
         case View::Detail: drawDetail(); break;
         case View::Status: drawStatus(); break;
+        case View::Settings: drawSettings(); break;
     }
 }
 
 // Clamped against what the last draw actually counted, so a page that grows
 // a row stays reachable without anybody updating a constant.
 void scrollStatus(int delta) {
-    const int visible = (FOOTER_Y - (CONTENT_Y + 28)) / 12;
+    const int visible = (FOOTER_Y - (CONTENT_Y + 28)) / STATUS_ROW_H;
     int maxTop = gStatusRows - visible;
     if (maxTop < 0) maxTop = 0;
 
@@ -1157,17 +1905,24 @@ void scrollStatus(int delta) {
 
 void setView(View v) {
     if (v == gView) return;
+    cancelEdit();
     gPreviousView = gView;
     gView = v;
     // Always arrive at the top of the diagnostics rather than wherever it was
     // left, which from the outside looks like a page with its head cut off.
     if (v == View::Status) gStatusTop = 0;
+    if (v == View::Settings) gSettingsTop = 0;
     // A view change replaces the whole screen, so clear the ghosting with it.
     display::invalidate(true);
 }
 
 void goBack() {
-    if (gView == View::Detail || gView == View::Status) {
+    if (gEditField != EditField::None) {
+        cancelEdit();
+        display::invalidate();
+        return;
+    }
+    if (gView == View::Detail || gView == View::Status || gView == View::Settings) {
         setView(gPreviousView == gView ? View::Radar : gPreviousView);
     } else {
         gSelectedHex[0] = '\0';
@@ -1205,14 +1960,154 @@ void panOffsetNm(float *eastNm, float *northNm) {
     if (northNm) *northNm = gPanNorthNm;
 }
 
+void scrollList(int delta) {
+    rebuildListOrder();
+    const int rows = CONTENT_H / ROW_H;
+    int maxTop = gListCount - rows;
+    if (maxTop < 0) maxTop = 0;
+    int next = gListTop + delta;
+    if (next < 0) next = 0;
+    if (next > maxTop) next = maxTop;
+    if (next == gListTop) return;
+    gListTop = next;
+    gListFollowSelection = false;
+    display::invalidate();
+}
+
+void handleEditKey(char key) {
+    if (key == keypad::kEnter) {
+        commitEdit();
+        return;
+    }
+    if (key == keypad::kBackspace) {
+        const size_t n = strlen(gEditBuf);
+        if (n == 0) {
+            cancelEdit();
+            display::invalidate();
+            return;
+        }
+        gEditBuf[n - 1] = '\0';
+        display::invalidate();
+        return;
+    }
+    if (key == keypad::kShift) {
+        gEditShift = !gEditShift;
+        display::invalidate();
+        return;
+    }
+    if (key == keypad::kSymbol) {
+        gEditSym = !gEditSym;
+        display::invalidate();
+        return;
+    }
+    const char mapped = mapEditChar(key);
+    if (!mapped) return;
+    const size_t cap =
+        (gEditField == EditField::Ssid)      ? settings::kWifiSsidMax
+        : (gEditField == EditField::LocalUrl) ? settings::kLocalUrlMax
+                                              : settings::kWifiPassMax;
+    const size_t n = strlen(gEditBuf);
+    if (n >= cap) return;
+    gEditBuf[n] = mapped;
+    gEditBuf[n + 1] = '\0';
+    if (gEditShift) gEditShift = false;  // sticky for one character
+    display::invalidate();
+}
+
+bool handleSettingsKey(char key) {
+    if (gEditField != EditField::None) {
+        handleEditKey(key);
+        return true;
+    }
+    switch (key) {
+        case '1':
+        case '2':
+        case '3':
+        case '4':
+            gSettingsCategory = static_cast<uint8_t>(key - '1');
+            gSettingsTop = 0;
+            gSettingsRow = firstSettingInCategory(gSettingsCategory);
+            display::invalidate();
+            return true;
+        case 'w':
+        case 'k':
+            moveSettingsRow(-1);
+            return true;
+        case 's':
+        case 'j':
+            moveSettingsRow(1);
+            return true;
+        case 'a':
+            applySettingDelta(-1);
+            return true;
+        case 'd':
+            applySettingDelta(1);
+            return true;
+        case keypad::kEnter:
+            activateSetting();
+            return true;
+        case 'c':
+            if (static_cast<SetRow>(gSettingsRow) == SetRow::Home) {
+                Settings &s = settings::get();
+                s.homeOverride = false;
+                settings::markDirty();
+                display::invalidate();
+            } else if (static_cast<SetRow>(gSettingsRow) == SetRow::MapFile) {
+                settings::setMapPath("");
+                basemap::reload();
+                display::invalidate();
+            } else if (static_cast<SetRow>(gSettingsRow) == SetRow::LocalUrl) {
+                settings::clearLocalUrl();
+                gRefreshRequested = true;
+                display::invalidate();
+            } else if (static_cast<SetRow>(gSettingsRow) == SetRow::WifiSsid ||
+                       static_cast<SetRow>(gSettingsRow) == SetRow::WifiPass) {
+                settings::clearWifiOverride();
+                net::reconnect();
+                display::invalidate();
+            }
+            return true;
+        default:
+            return false;
+    }
+}
+
 uint16_t rangeNm() { return currentRangeNm(); }
+
+const char *selectedHex() { return gSelectedHex; }
+
+bool consumeFilterChange() {
+    const bool r = gFilterChanged;
+    gFilterChanged = false;
+    return r;
+}
+
+bool consumePollPaceChange() {
+    const bool r = gPollPaceChanged;
+    gPollPaceChanged = false;
+    return r;
+}
 
 void handleKey(char key) {
     if (key == 0) return;
 
+    if (gView == View::Settings && handleSettingsKey(key)) return;
+
     switch (key) {
         case 't':
             setView(gView == View::Radar ? View::List : View::Radar);
+            break;
+
+        case 'o':
+            setView(gView == View::Settings ? gPreviousView : View::Settings);
+            break;
+
+        case 'h':
+            if (gView == View::Radar || gView == View::List ||
+                gView == View::Settings) {
+                filter::cycle();
+                noteFilterChanged();
+            }
             break;
 
         // WASD pans the plot on the radar. In the list and detail views there
@@ -1256,6 +2151,10 @@ void handleKey(char key) {
             recentre();
             break;
 
+        case 'b':
+            toggleFollow();
+            break;
+
         case 'k':
             if (gView == View::Status) {
                 scrollStatus(-1);
@@ -1296,17 +2195,23 @@ void handleKey(char key) {
         case 'g':
             gCentreOnGnss = !gCentreOnGnss;
             // Our own position is about to jump; a pan measured from the old
-            // one would be meaningless.
+            // one would be meaningless, and so would a follow offset.
+            gFollowAircraft = false;
             gPanEastNm = 0.0f;
             gPanNorthNm = 0.0f;
             persist();
             display::invalidate();
             break;
 
-        case 'l':
-            power::setKeypadBacklight(!power::keypadBacklight());
+        case 'l': {
+            Settings &s = settings::get();
+            cycleByte(&s.keypadBacklight, static_cast<uint8_t>(BacklightMode::Auto),
+                      1);
+            power::refreshKeypadBacklight(s.keypadBacklight);
             persist();
+            if (gView == View::Settings) display::invalidate();
             break;
+        }
 
         case 'm':
             gMapEnabled = !gMapEnabled;
@@ -1330,6 +2235,10 @@ void handleKey(char key) {
             setView(gView == View::Status ? gPreviousView : View::Status);
             break;
 
+        case 'v':
+            sdcard::requestScreenshot();
+            break;
+
         default:
             break;
     }
@@ -1337,23 +2246,44 @@ void handleKey(char key) {
 
 // A press and release in roughly the same place.
 void handleTap(int16_t x, int16_t y) {
-    // On the detail and diagnostics pages both strips of chrome mean "back".
-    // Swapping radar for list is meaningless from a page that is neither, and
-    // the footer legend on both of them literally reads "U:back" -- so tapping
-    // it has to do that. It used to ask for the detail view, which from the
-    // detail view is a no-op, leaving the one strip of screen that says "back"
-    // as the one strip that ignored you.
-    const bool subPage = (gView == View::Detail || gView == View::Status);
-
     if (y < STATUS_H) {
-        if (subPage) goBack();
-        else setView(gView == View::Radar ? View::List : View::Radar);
         return;
     }
 
     if (y >= FOOTER_Y) {
-        if (subPage) goBack();
-        else if (selected()) setView(View::Detail);
+        if (gView == View::Detail || gView == View::Status) {
+            if (x < 72) goBack();
+            return;
+        }
+        if (x < SCREEN_W / 3) setView(View::Radar);
+        else if (x < 2 * SCREEN_W / 3) setView(View::List);
+        else setView(View::Settings);
+        return;
+    }
+
+    if (gView == View::Radar && y >= READOUT_Y) {
+        if (selected()) setView(View::Detail);
+        return;
+    }
+
+    if (gView == View::Settings) {
+        if (y < SETTINGS_TOP) {
+            uint8_t category = static_cast<uint8_t>(x / (SCREEN_W / 4));
+            if (category > 3) category = 3;
+            if (category != gSettingsCategory) {
+                gSettingsCategory = category;
+                gSettingsTop = 0;
+                gSettingsRow = firstSettingInCategory(category);
+                display::invalidate();
+            }
+            return;
+        }
+        if (y >= SETTINGS_BOTTOM) return;
+        const int row = (y - SETTINGS_TOP) / SETTINGS_ROW_H + gSettingsTop;
+        if (row >= 0 && row < gSettingsRows) {
+            gSettingsRow = settingAtCategoryIndex(gSettingsCategory, row);
+            activateSetting();
+        }
         return;
     }
 
@@ -1368,6 +2298,10 @@ void handleTap(int16_t x, int16_t y) {
         }
         if (isPanned() && inButton(x, y, BTN_HOME_X, BTN_HOME_Y)) {
             recentre();
+            return;
+        }
+        if (inButton(x, y, BTN_FOLLOW_X, BTN_FOLLOW_Y)) {
+            toggleFollow();
             return;
         }
     }
@@ -1389,15 +2323,20 @@ void handleTap(int16_t x, int16_t y) {
         if (best >= 0) {
             selectIndex(best);
             display::invalidate();
+        } else if (gSelectedHex[0]) {
+            clearSelection();
         }
         return;
     }
 
     if (gView == View::List && gCtx.tracker) {
-        const int row = (y - CONTENT_Y - ROW_H) / ROW_H;
-        if (row < 0) return;  // header
-        const int idx = gListTop + row;
-        if (idx >= static_cast<int>(gCtx.tracker->count())) return;
+        rebuildListOrder();
+        const int row = (y - CONTENT_Y) / ROW_H;
+        if (row < 0) return;
+        const int vis = gListTop + row;
+        if (vis < 0 || vis >= gListCount) return;
+        const int idx = gListOrder[vis];
+        gListFollowSelection = true;
         if (idx == selectionIndex()) {
             setView(View::Detail);
         } else {
@@ -1407,7 +2346,6 @@ void handleTap(int16_t x, int16_t y) {
         return;
     }
 
-    if (gView == View::Detail || gView == View::Status) goBack();
 }
 
 void handleTouch(const touch::Event &event) {
@@ -1429,7 +2367,8 @@ void handleTouch(const touch::Event &event) {
 
     // Drag the map: the content follows your finger, so the plot centre moves
     // the opposite way. Only the radar has anything to pan.
-    if (gView == View::Radar && gTouchDownY >= STATUS_H && gTouchDownY < FOOTER_Y) {
+    if (gView == View::Radar && gTouchDownY >= SCOPE_Y &&
+        gTouchDownY < READOUT_Y) {
         const float scale = pixelsPerNm();
         panByNm(-dx / scale, dy / scale);
         return;
@@ -1440,11 +2379,23 @@ void handleTouch(const touch::Event &event) {
     // from a tap above, so it can scroll, content following the finger the
     // same way the radar does.
     if (gView == View::Status && gTouchDownY >= STATUS_H && gTouchDownY < FOOTER_Y) {
-        scrollStatus(-dy / 12);
+        scrollStatus(-dy / STATUS_ROW_H);
+        return;
+    }
+    if (gView == View::Settings && gTouchDownY >= SETTINGS_TOP && gTouchDownY < SETTINGS_BOTTOM) {
+        scrollSettings(-dy / SETTINGS_ROW_H);
+        return;
+    }
+    if (gView == View::List && gTouchDownY >= STATUS_H && gTouchDownY < FOOTER_Y) {
+        scrollList(-dy / ROW_H);
     }
 }
 
 bool tick() {
+    // Before the fingerprint, so a moving target shifts the plot centre and
+    // the hash in the same pass.
+    updateFollow();
+
     // Fold the chrome into the fingerprint so a battery or Wi-Fi change also
     // repaints, but quantise the noisy inputs.
     // The radar asks whether anything moved a pixel; the list and detail views
@@ -1463,9 +2414,35 @@ bool tick() {
     mix(static_cast<uint32_t>(gRangeIndex));
     mix(static_cast<uint32_t>(static_cast<int32_t>(gPanEastNm * 10.0f)));
     mix(static_cast<uint32_t>(static_cast<int32_t>(gPanNorthNm * 10.0f)));
+    mix(static_cast<uint32_t>(gFollowAircraft));
     mix(static_cast<uint32_t>(gListTop));
     mix(static_cast<uint32_t>(gStatusTop));
+    mix(static_cast<uint32_t>(gSettingsTop));
+    mix(static_cast<uint32_t>(gSettingsRow));
+    mix(static_cast<uint32_t>(gSettingsCategory));
+    mix(static_cast<uint32_t>(gEditField));
     mix(static_cast<uint32_t>(gMapEnabled));
+    mix(settings::get().distanceUnits);
+    mix(settings::get().speedUnits);
+    mix(settings::get().trafficFilter);
+    mix(settings::get().listSort);
+    mix(settings::get().pollPace);
+    mix(settings::get().swapXY);
+    mix(settings::get().mirrorX);
+    mix(settings::get().mirrorY);
+    mix(settings::get().homeOverride);
+    mix(static_cast<uint32_t>(settings::get().homeLatE7));
+    mix(static_cast<uint32_t>(settings::get().homeLonE7));
+    mix(static_cast<uint32_t>(settings::wifiOverride()));
+    mix(static_cast<uint32_t>(settings::logEnabled()));
+    mix(static_cast<uint32_t>(settings::faceDownIdle()));
+    mix(settings::get().keypadBacklight);
+    for (const char *p = settings::mapPath(); *p; ++p) {
+        mix(static_cast<uint8_t>(*p));
+    }
+    for (const char *p = settings::localUrl(); *p; ++p) {
+        mix(static_cast<uint8_t>(*p));
+    }
     // The basemap and our own crosshair move with our position even when no
     // aircraft do, so it has to be in the fingerprint -- at the same pixel
     // resolution as everything else on the radar, which is what finally
@@ -1481,10 +2458,13 @@ bool tick() {
     }
     mix(gCtx.batteryValid ? gCtx.batteryPercent : 0xFFu);
     mix(static_cast<uint32_t>(gCtx.wifiConnected));
+    mix(static_cast<uint32_t>(gCtx.networkActivity.upload));
+    mix(static_cast<uint32_t>(gCtx.networkActivity.download));
     mix(static_cast<uint32_t>(gCtx.wifiConnected ? wifiBars(gCtx.wifiRssi) : -1));
     mix(static_cast<uint32_t>(gCtx.gnssFix));
     mix(static_cast<uint32_t>(gnssQuality(gCtx.gnssFix, gCtx.gnssSatellites)));
     mix(feedAgeBucket());
+    mix(static_cast<uint32_t>(gCtx.idle));
     // Minute resolution: this alone repaints the panel once a minute, which is
     // the accepted price of a clock on the glass.
     mix(gCtx.clockValid
@@ -1495,6 +2475,34 @@ bool tick() {
     // this would repaint the panel for a keypress that changed nothing.
     if (gView == View::Status) {
         mix(static_cast<uint32_t>(keypad::lastKey().raw));
+        mix(static_cast<uint32_t>(static_cast<uint16_t>(touch::lastTap().x)));
+        mix(static_cast<uint32_t>(static_cast<uint16_t>(touch::lastTap().y)));
+        mix(static_cast<uint32_t>(sdcard::shotCount()));
+        // Quantised so GNSS-grade IMU noise does not thrash the panel: lux to
+        // the nearest 10 lx, accel to 0.2 m/s^2. Orientation is a string that
+        // only flips on a real attitude change.
+        float lux = 0.0f;
+        if (als::lux(&lux)) {
+            mix(static_cast<uint32_t>(lroundf(lux / 10.0f)));
+        } else {
+            mix(0xFFFEu);
+        }
+        float ax = 0.0f, ay = 0.0f, az = 0.0f;
+        if (imu::acceleration(&ax, &ay, &az)) {
+            mix(static_cast<uint32_t>(lroundf(ax * 5.0f)));
+            mix(static_cast<uint32_t>(lroundf(ay * 5.0f)));
+            mix(static_cast<uint32_t>(lroundf(az * 5.0f)));
+        } else {
+            mix(0xFFFEu);
+        }
+        for (const char *p = imu::orientation(); *p; ++p) {
+            mix(static_cast<uint8_t>(*p));
+        }
+    }
+    if (gView == View::Settings && gEditField != EditField::None) {
+        for (const char *p = gEditBuf; *p; ++p) mix(static_cast<uint8_t>(*p));
+        mix(static_cast<uint32_t>(gEditShift));
+        mix(static_cast<uint32_t>(gEditSym));
     }
 
     return display::render(h, drawCurrentView);

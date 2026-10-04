@@ -13,15 +13,16 @@ on the device instead costs the Pi nothing and needs no network -- the mapping
 is fixed, so there is nothing to keep fresh but a reflash.
 
 The whole database is 615k records and 30 MB uncompressed, which does not fit
-in a 3.4 MB SPIFFS partition and does not need to: an aircraft has to be within
-radio range to appear on the plot, so only the ICAO address blocks you can
-actually hear are worth carrying.
+in SPIFFS or in the 8 MB of PSRAM. A regional slice is the right thing to
+flash; the worldwide table belongs on the SD card, where the firmware seeks it
+on demand.
 
 Source: https://github.com/wiedehopf/tar1090-db (ODbL), fetched on demand and
 cached in tools/.dbcache. Only the Python standard library is used.
 
     python tools/build_db.py                       # New Zealand (C8)
     python tools/build_db.py --blocks C8,7C        # + Australia
+    python tools/build_db.py --blocks all          # worldwide, for the SD card
     python tools/build_db.py --blocks C8,7C --no-operators
 """
 
@@ -182,11 +183,8 @@ def main():
     strtab_off = HEADER_LEN + len(interned) * RECORD_LEN
     pool_off = strtab_off + len(strings) * 4
     size = pool_off + len(blob)
-    if size > SPIFFS_BUDGET:
-        sys.exit(f'{size/1e6:.1f} MB exceeds the SPIFFS budget -- narrow '
-                 f'--blocks, or pass --no-operators')
 
-    os.makedirs(os.path.dirname(args.out), exist_ok=True)
+    os.makedirs(os.path.dirname(args.out) or '.', exist_ok=True)
     with open(args.out, 'wb') as f:
         header = (MAGIC
                   + struct.pack('<HH', VERSION, RECORD_LEN)
@@ -208,9 +206,13 @@ def main():
     named = sum(1 for r in interned if r[3] != NO_STRING)
     print(f'\n  {len(interned)} records, {named} with a description, '
           f'{len(strings)} distinct strings ({len(blob)/1024:.0f} KB pooled)')
-    print(f'  -> {args.out} ({size/1024:.0f} KB, '
-          f'{100.0*size/SPIFFS_BUDGET:.1f}% of the SPIFFS budget)')
-    print('  flash it with: pio run -t uploadfs')
+    print(f'  -> {args.out} ({size/1024:.0f} KB)')
+    if size > SPIFFS_BUDGET:
+        print(f'  {size/1e6:.1f} MB is too big for SPIFFS or PSRAM -- copy it '
+              f'to the SD card as /aircraftdb.bin (see tools/pack_sd.py)')
+    else:
+        print(f'  {100.0*size/SPIFFS_BUDGET:.1f}% of the SPIFFS budget; '
+              f'flash it with: pio run -t uploadfs')
 
 
 if __name__ == '__main__':

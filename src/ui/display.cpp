@@ -1,11 +1,19 @@
 #include "display.h"
 
 #include <Arduino.h>
-#include <GxEPD2_BW.h>
 #include <SPI.h>
+#include <string.h>
+
+// GxEPD2 keeps the 1-bit page buffer private. page_height == HEIGHT, so that
+// buffer is the whole 240x320 frame, which is what a PBM dump needs. The
+// define is scoped to this include; nothing else in the firmware uses it.
+#define private public
+#include <GxEPD2_BW.h>
+#undef private
 
 #include "board_pins.h"
 #include "config.h"
+#include "hw/spibus.h"
 
 namespace display {
 namespace {
@@ -28,8 +36,16 @@ bool gForceFull = true;
 }  // namespace
 
 void begin() {
+    spibus::begin();
     SPI.begin(BOARD_SPI_SCK, BOARD_SPI_MISO, BOARD_SPI_MOSI);
+    // Match LilyGO's factory clock: 2 MHz is enough for the UC8253 and keeps
+    // the shared bus well clear of the SD card's 10 MHz setting.
+    gEpd.epd2.selectSPI(SPI, SPISettings(2000000, MSBFIRST, SPI_MODE0));
     gEpd.init(115200, true, 2, false);
+    // BUSY is active-low and the panel stops driving it once powered down.
+    // A floating read looks "busy", and every later refresh then sits in
+    // GxEPD2's 10 s timeout. Pull the line up so idle reads as idle.
+    pinMode(BOARD_EPD_BUSY, INPUT_PULLUP);
     gEpd.setRotation(0);  // portrait, 240 x 320, keyboard at the bottom
     gEpd.setTextColor(GxEPD_BLACK);
     gEpd.setTextWrap(false);
@@ -69,6 +85,8 @@ bool render(uint32_t sceneHash, void (*draw)()) {
         gEpd.setPartialWindow(0, 0, gEpd.width(), gEpd.height());
     }
 
+    spibus::Lock lock;
+
     gEpd.firstPage();
     do {
         gEpd.fillScreen(GxEPD_WHITE);
@@ -98,6 +116,24 @@ bool render(uint32_t sceneHash, void (*draw)()) {
     return true;
 }
 
-void hibernate() { gEpd.hibernate(); }
+void hibernate() {
+    spibus::Lock lock;
+    gEpd.hibernate();
+    // Previous-image RAM on the UC8253 does not survive deep sleep, so the
+    // next update cannot be a partial.
+    gForceRepaint = true;
+    gForceFull = true;
+    gHaveLastHash = false;
+}
+
+size_t frameBytes() {
+    return static_cast<size_t>(EPD_WIDTH / 8) * static_cast<size_t>(EPD_HEIGHT);
+}
+
+bool copyFrame(uint8_t *dst, size_t len) {
+    if (!dst || len < frameBytes()) return false;
+    memcpy(dst, gEpd._buffer, frameBytes());
+    return true;
+}
 
 }  // namespace display

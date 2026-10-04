@@ -40,7 +40,7 @@ enum class AdsbProvider : uint8_t { ADSB_LOL, ADSB_FI, AIRPLANES_LIVE, LOCAL };
 // of Wi-Fi range and still see traffic. A toggle is kept in NVS, so the feed
 // you were last on is the one you come back up on.
 #define ADSB_PROVIDER_DEFAULT AdsbProvider::LOCAL
-#define ADSB_PROVIDER_REMOTE  AdsbProvider::ADSB_FI
+#define ADSB_PROVIDER_REMOTE  AdsbProvider::AIRPLANES_LIVE
 
 // Sent so feed operators can identify (and contact) misbehaving clients.
 #define ADSB_USER_AGENT "tdeckpro-adsb/0.1 (+https://github.com/)"
@@ -78,6 +78,11 @@ enum class AdsbProvider : uint8_t { ADSB_LOL, ADSB_FI, AIRPLANES_LIVE, LOCAL };
 #define AIRCRAFT_STALE_MS 90000UL
 #define MAX_AIRCRAFT 96
 
+// Per-aircraft position trail samples kept in RAM. Drawn only for the selected
+// target so the radar stays readable on the e-paper display.
+#define AIRCRAFT_TRAIL_POINTS 12
+#define AIRCRAFT_TRAIL_MIN_NM 0.2f
+
 // ========================================================== Home position ===
 // HOME_LATITUDE / HOME_LONGITUDE are in secrets.h alongside the Wi-Fi
 // credentials -- an address is worth keeping out of a public repository too.
@@ -113,29 +118,33 @@ enum class AdsbProvider : uint8_t { ADSB_LOL, ADSB_FI, AIRPLANES_LIVE, LOCAL };
 
 // ================================================================== Map =====
 // Vector basemap: coastline, airports and (optionally) airspace, drawn under
-// the radar plot. Built offline and flashed separately from the firmware:
+// the radar plot. Built offline and flashed separately from the firmware, or
+// copied onto the SD card as /map.bin (preferred when present):
 //
 //     python tools/build_map.py          # writes data/map.bin
 //     pio run -t uploadfs                # flashes it into SPIFFS
 //
 // Missing data is not an error -- the radar simply draws without it. Toggled
-// at runtime with the 'm' key.
+// at runtime with the 'm' key. Additional region files can live in /maps on
+// the card and are picked from the settings page.
 #define MAP_ENABLED_BY_DEFAULT true
 #define MAP_FILE "/map.bin"
 
-// ICAO address -> registration and type, also in SPIFFS, also optional:
+// ICAO address -> registration and type, also optional, from SD or SPIFFS:
 //
 //     python tools/build_db.py           # writes data/aircraftdb.bin
 //     pio run -t uploadfs
 //
 // Only needed because a local receiver's aircraft.json carries neither field.
-// Absent, those columns stay empty exactly as they did before.
+// Absent, those columns stay empty exactly as they did before. A worldwide
+// table is too large for SPIFFS and PSRAM; put it on the SD card and the
+// firmware seeks it on demand (see aircraftdb::details).
 #define AIRCRAFT_DB_FILE "/aircraftdb.bin"
 
 // Plan-view silhouettes for the detail page, keyed by type designator:
 //
 //     python tools/build_icons.py        # writes data/icons.bin
-//     pio run -t uploadfs
+//     pio run -t uploadfs                # or copy onto the SD card
 //
 // Also optional. Absent, the detail page simply lays out without one.
 #define ICON_FILE "/icons.bin"
@@ -156,14 +165,15 @@ enum class AdsbProvider : uint8_t { ADSB_LOL, ADSB_FI, AIRPLANES_LIVE, LOCAL };
 #define CLOCK_NTP_SERVER_2 "time.nist.gov"
 
 // ================================================================ Units =====
-// Altitude is always feet. Choose horizontal units:
+// Altitude is always feet. Choose horizontal units (boot default; the
+// settings page can change this at runtime):
 //   0 = nautical miles, 1 = statute miles, 2 = kilometres
 #define UNITS_DISTANCE 0
 // Speed: 0 = knots, 1 = mph, 2 = km/h
 #define UNITS_SPEED 0
 
 // =============================================================== Display ====
-// Range rings, in nautical miles, cycled with the 'a' / 'd' keys.
+// Range rings, in nautical miles, cycled with the 'z' / 'x' keys.
 static const uint16_t kRangeStepsNm[] = {5, 10, 20, 40, 60, 100, 150, 250};
 static const size_t kRangeStepCount = sizeof(kRangeStepsNm) / sizeof(kRangeStepsNm[0]);
 #define RANGE_DEFAULT_INDEX 3   // 40 nm
@@ -194,8 +204,27 @@ static const size_t kRangeStepCount = sizeof(kRangeStepsNm) / sizeof(kRangeSteps
 #define EPD_FULL_REFRESH_EVERY 60
 #define EPD_FULL_REFRESH_MAX_AGE_MS 600000UL   // 10 minutes
 
-// Keyboard backlight on at boot.
-#define KEYPAD_BACKLIGHT_DEFAULT false
+// Keyboard backlight at boot, and the fallback when nothing has been saved:
+//   0 = off, 1 = on, 2 = auto (ALS, with the hysteresis below).
+#define KEYPAD_BACKLIGHT_DEFAULT 0
+
+// Auto mode: LED on at or below the first, off at or above the second.
+// Between them the last state is kept so a room around 40 lx does not flicker.
+#define KEYPAD_BACKLIGHT_AUTO_ON_LX  20.0f
+#define KEYPAD_BACKLIGHT_AUTO_OFF_LX 80.0f
+
+// Park the panel (and slow the feed) when the IMU reports face-down for
+// FACE_DOWN_IDLE_MS. The panel is hibernated, not merely left undrawn, and
+// the keypad LED is forced off. Saves wear and a chunk of the poll power
+// budget while the unit is in a pocket. Toggle from Settings; wake on any
+// key/touch or when the attitude leaves face-down.
+// Off by default: IMU Z polarity on this board is still a best guess, and a
+// wrong sign hibernates the panel a couple of seconds after boot -- which
+// reads as a freeze. Turn it on from Settings once Diagnostics shows the
+// expected "face up" / "face down" labels.
+#define FACE_DOWN_IDLE_DEFAULT false
+#define FACE_DOWN_IDLE_MS 5000UL
+#define FACE_DOWN_IDLE_POLL_MS 60000UL
 
 // =========================================================== Diagnostics ===
 // Seconds between heap lines on the serial log; 0 keeps it quiet.
